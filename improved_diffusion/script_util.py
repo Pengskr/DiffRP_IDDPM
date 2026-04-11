@@ -14,21 +14,21 @@ def model_and_diffusion_defaults():
     """
     return dict(
         image_size=64,
-        num_channels=128,
+        num_channels=128,               # 模型每一层的基础通道数，乘以 channel_mult 后得到每一层的实际通道数，增加 num_channels 可以提升模型的表达能力，但也会增加计算资源的需求
         num_res_blocks=2,
-        num_heads=4,
+        num_heads=4,                    # 控制多头注意力机制中头的数量，增加头的数量可以让模型在不同的子空间中学习不同的特征表示，从而提升模型的表达能力和性能
         num_heads_upsample=-1,
-        attention_resolutions="16,8",
-        dropout=0.0,
+        attention_resolutions="16,8",   # 控制在哪些分辨率（如 16x16, 8x8）下开启注意力
+        dropout=0.0,                    # dropout 率，增加 dropout 可以帮助模型防止过拟合，但过高的 dropout 率可能会导致模型欠拟合
         learn_sigma=False,
         sigma_small=False,
         class_cond=False,
-        diffusion_steps=1000,
+        diffusion_steps=1000,           # 扩散过程的总步数
         noise_schedule="linear",
         timestep_respacing="",
         use_kl=False,
-        predict_xstart=False,
-        rescale_timesteps=True,
+        predict_xstart=False,           # 控制模型的输出目标，如果 predict_xstart 为 False，则模型预测噪声 epsilon；如果 predict_xstart 为 True，则模型直接预测原始图像 x_0，这两种方式在训练和采样过程中会有不同的表现和效果
+        rescale_timesteps=True,         # 是否对时间步长进行缩放，通常在训练过程中会将时间步长缩放到 [0, 1000] 的范围内，以帮助模型更好地学习不同时间步长下的特征表示
         rescale_learned_sigmas=True,
         use_checkpoint=False,
         use_scale_shift_norm=True,
@@ -110,10 +110,10 @@ def create_model(
         attention_ds.append(image_size // int(res))
 
     return UNetModel(
-        in_channels=3,
-        model_channels=num_channels,
-        out_channels=(3 if not learn_sigma else 6),
-        num_res_blocks=num_res_blocks,
+        in_channels=3,                                          # 输入图像的通道数，通常为3（RGB图像）  
+        model_channels=num_channels,                            # mc：模型每一层的基础通道数，乘以channel_mult后得到每一层的实际通道数，中间层的输入输出通道数不变：num_channels * channel_mult[-1]
+        out_channels=(3 if not learn_sigma else 6),             # 输出通道数，如果 learn_sigma 为 False，则输出3通道的图像；如果 learn_sigma 为 True，则输出6通道，其中前3通道用于预测图像，后3通道用于预测噪声的方差
+        num_res_blocks=num_res_blocks,                          # nr：每个分辨率下的残差块数量  
         attention_resolutions=tuple(attention_ds),
         dropout=dropout,
         channel_mult=channel_mult,

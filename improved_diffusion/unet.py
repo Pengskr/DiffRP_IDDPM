@@ -302,13 +302,13 @@ class UNetModel(nn.Module):
         self,
         in_channels,
         model_channels,
-        out_channels,
+        out_channels,               # 输出通道数，通常为3（RGB图像）或6（如果 learn_sigma 为 True，则输出6通道，其中前3通道用于预测图像，后3通道用于预测噪声的方差）
         num_res_blocks,
         attention_resolutions,
         dropout=0,
         channel_mult=(1, 2, 4, 8),
         conv_resample=True,
-        dims=2,
+        dims=2,                     # 控制输入信号的维度，2表示输入是二维图像，3表示输入是三维体数据，1表示输入是一维序列数据
         num_classes=None,
         use_checkpoint=False,
         num_heads=1,
@@ -343,10 +343,11 @@ class UNetModel(nn.Module):
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
 
+        # U-Net 架构的第一个输入层，将输入图像映射到 model_channels 维的特征空间
         self.input_blocks = nn.ModuleList(
             [
                 TimestepEmbedSequential(
-                    conv_nd(dims, in_channels, model_channels, 3, padding=1)
+                    conv_nd(dims, in_channels, model_channels, 3, padding=1)    # 使用 3x3 卷积 + padding 1 可以确保图像的分辨率在这一层不会发生改变。
                 )
             ]
         )
@@ -382,6 +383,7 @@ class UNetModel(nn.Module):
                 input_block_chans.append(ch)
                 ds *= 2
 
+        # 中间层，包含一个 ResBlock、一个 AttentionBlock 和另一个 ResBlock，并没有改变通道数和分辨率
         self.middle_block = TimestepEmbedSequential(
             ResBlock(
                 ch,
@@ -480,11 +482,11 @@ class UNetModel(nn.Module):
             emb = emb + self.label_emb(y)
 
         h = x.type(self.inner_dtype)
-        for module in self.input_blocks:
+        for module in self.input_blocks:    # 解码器（输入层和下采样层），逐层处理输入图像，并在需要时将中间特征图保存到 hs 列表中，以便后续的上采样层使用
             h = module(h, emb)
             hs.append(h)
-        h = self.middle_block(h, emb)
-        for module in self.output_blocks:
+        h = self.middle_block(h, emb)       # 中间层，处理下采样后的特征图，提取更抽象的特征表示
+        for module in self.output_blocks:   # 编码器（上采样层），逐层处理特征图，并在需要时将之前保存的特征图与当前特征图进行拼接，以便恢复空间分辨率和细节信息
             cat_in = th.cat([h, hs.pop()], dim=1)
             h = module(cat_in, emb)
         h = h.type(x.dtype)

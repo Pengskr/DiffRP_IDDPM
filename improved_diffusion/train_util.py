@@ -79,7 +79,7 @@ class TrainLoop:
         if self.use_fp16:
             self._setup_fp16()
 
-        self.opt = AdamW(self.master_params, lr=self.lr, weight_decay=self.weight_decay)
+        self.opt = AdamW(self.master_params, lr=self.lr, weight_decay=self.weight_decay)    # AdamW 修正了 Adam 在权重衰减（Weight Decay）实现上的一个数学错误。
         if self.resume_step:
             self._load_optimizer_state()
             # Model was resumed, either due to a restart or a checkpoint
@@ -160,15 +160,15 @@ class TrainLoop:
 
     def run_loop(self):
         while (
-            not self.lr_anneal_steps
-            or self.step + self.resume_step < self.lr_anneal_steps
+            not self.lr_anneal_steps                                    # 无限模式：如果 lr_anneal_steps 设为 0（默认通常如此），循环将永远运行下去，直到你手动停止。
+            or self.step + self.resume_step < self.lr_anneal_steps      # 有限模式：如果你设定了具体lr_anneal_steps（例如 500,000 步），它会计算 当前步数 + 续训步数 是否达到了目标。这对于实施**学习率退火（Learning Rate Annealing）**非常重要，即在达到特定步数后停止训练。
         ):
-            batch, cond = next(self.data)
-            self.run_step(batch, cond)
+            batch, cond = next(self.data)                               # 从数据生成器中获取一个批次的训练数据和对应的条件信息（如果有的话）。
+            self.run_step(batch, cond)                                  # 执行一个训练步骤，包括前向传播、反向传播和优化器更新
             if self.step % self.log_interval == 0:
-                logger.dumpkvs()
+                logger.dumpkvs()                                        # 将训练损失（Loss）、学习率、显存占用等数据写入控制台或磁盘文件（如 CSV 或 TensorBoard）。
             if self.step % self.save_interval == 0:
-                self.save()
+                self.save()                                             # 每隔 save_interval 步，保存模型检查点。
                 # Run for a finite amount of time in integration tests.
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
@@ -197,7 +197,7 @@ class TrainLoop:
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
             compute_losses = functools.partial(
-                self.diffusion.training_losses,
+                self.diffusion.training_losses, # 进行一次前向过程和神经网络预测，计算损失函数，返回一个字典，包含了不同类型的损失（如 "loss", "mse", "vb" 等），这些损失可以用于监控训练过程中的性能和收敛情况
                 self.ddp_model,
                 micro,
                 t,
