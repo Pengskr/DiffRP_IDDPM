@@ -93,7 +93,7 @@ def create_argparser():
         clip_denoised=True,
         num_samples=10000,
         batch_size=16,
-        use_ddim=False,
+        use_ddim=True,
         model_path="",
     )
     defaults.update(model_and_diffusion_defaults())

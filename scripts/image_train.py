@@ -63,8 +63,8 @@ def create_argparser():
         schedule_sampler="loss-second-moment",     
         lr=1e-4,
         weight_decay=0.0,
-        lr_anneal_steps=0,
-        batch_size=1,
+        lr_anneal_steps=100,
+        batch_size=128,
         microbatch=-1,                  # -1 disables microbatches
         ema_rate="0.9999",              # comma-separated list of EMA values
         log_interval=10,

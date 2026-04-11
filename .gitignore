@@ -1,3 +1,5 @@
 .DS_Store
 __pycache__/
-
+datasets/cifar_train/
+datasets/cifar_test/
+DiffRP_IDDPM.egg-info/
