@@ -10,8 +10,12 @@ if "OPENAI_LOGDIR" not in os.environ:
     subdir = datetime.datetime.now().strftime("run-%Y-%m-%d-%H-%M-%S")
     os.environ["OPENAI_LOGDIR"] = os.path.join(os.path.expanduser("~/DiffRP_IDDPM/my_model_checkpoints"), subdir)
 
+from torchvision.transforms import Compose, ToTensor, Resize
+from pathlib import Path
+
 from improved_diffusion import dist_util, logger
 from improved_diffusion.image_datasets import load_data
+from improved_diffusion.dataset import get_dataloader, yield_dataloader
 from improved_diffusion.resample import create_named_schedule_sampler
 from improved_diffusion.script_util import (
     model_and_diffusion_defaults,
@@ -36,18 +40,27 @@ def main():
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)  # 重要性采样器
 
     logger.log("creating data loader...")
-    data = load_data(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        image_size=args.image_size,
-        class_cond=args.class_cond,
-    )
+    # data = load_data(
+    #     data_dir=args.data_dir,
+    #     batch_size=args.batch_size,
+    #     image_size=args.image_size,
+    #     class_cond=args.class_cond,
+    # )
 
+    num_images = 4000
+    root_folder_data = Path('../datasets/PPD/train')
+    folder_Mo='MAP_with_start_end'
+    folder_P='PATH_20PIXEL'
+    os.makedirs('../work_dirs', exist_ok=True)
+    dataloader, dataloader_P, dataloader_Mo = get_dataloader(root_folder_data, folder_Mo, folder_P, num_images, args.batch_size, args.image_size)
+    diffusion.visualize_forward(dataloader_P, '../work_dirs/diffusion_forward.jpg', device='cpu', n_steps=1000)
+
+    
     logger.log("training...")
     TrainLoop(
         model=model,
         diffusion=diffusion,
-        data=data,                                  # 训练数据的生成器，提供训练过程中需要的图像和对应的条件信息（如果有的话）
+        data=yield_dataloader(dataloader),          # 训练数据的生成器，提供训练过程中需要的图像和对应的条件信息（如果有的话）
         batch_size=args.batch_size,
         microbatch=args.microbatch,
         lr=args.lr,                                 # Adam学习率
