@@ -7,6 +7,9 @@ Docstrings have been added, as well as DDIM sampling and a new collection of bet
 
 import enum
 import math
+import torch
+import einops
+import cv2
 
 import numpy as np
 import torch as th
@@ -185,7 +188,7 @@ class GaussianDiffusion:
         )
         return mean, variance, log_variance
 
-    def q_sample(self, x_start, t, noise=None):
+    def q_sample(self, M_o, x_start, t, noise=None):
         """
         前向过程
         Diffuse the data for a given number of diffusion steps.
@@ -202,8 +205,8 @@ class GaussianDiffusion:
         assert noise.shape == x_start.shape
         return (
             _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
-            * noise
+            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * M_o
+            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
     def q_posterior_mean_variance(self, x_start, x_t, t):
@@ -675,7 +678,7 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses(self, model, M_o, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
 
@@ -692,7 +695,7 @@ class GaussianDiffusion:
             model_kwargs = {}
         if noise is None:
             noise = th.randn_like(x_start)
-        x_t = self.q_sample(x_start, t, noise=noise)    # 前向过程：x_t = sqrt(alpha_bar_t) * x_start + sqrt(1-alpha_bar_t) * noise
+        x_t = self.q_sample(M_o, x_start, t, noise=noise)    # 前向过程：x_t = sqrt(alpha_bar_t) * x_start + M_o * sqrt(1-alpha_bar_t) + sqrt(1-alpha_bar_t) * noise
 
         terms = {}
 
@@ -824,6 +827,30 @@ class GaussianDiffusion:
             "xstart_mse": xstart_mse,
             "mse": mse,
         }
+    
+    def visualize_forward(self, dataloader_P, save_path, device, n_steps, noise=None):
+        device = device
+        M_o, P_i, _ = next(iter(dataloader_P))
+        P_i = P_i.to(device)
+        M_o = M_o.to(device)
+
+        P_i_ts = []
+        percents = torch.linspace(0, 0.99, 10)
+        for percent in percents:
+            t = torch.tensor([int(n_steps * percent)])
+            t = t.unsqueeze(1)
+            if noise is None:
+                noise = th.randn_like(P_i)
+            P_i_t = self.q_sample(M_o, P_i, t, noise=noise)    # 前向过程：x_t = sqrt(alpha_bar_t) * x_start + M_o * sqrt(1-alpha_bar_t) + sqrt(1-alpha_bar_t) * noise
+            P_i_ts.append(P_i_t)
+        res = torch.stack(P_i_ts, 0)
+        res = einops.rearrange(res, 'n1 n2 c h w -> (n2 h) (n1 w) c')
+        res = (res.clip(-1, 1) + 1) / 2 * 255
+        res = res.cpu().numpy().astype(np.uint8)
+
+        cv2.imwrite(save_path, res)
+
+        print("前向过程示意图片已保存。")
 
 
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
