@@ -163,8 +163,8 @@ class TrainLoop:
             not self.lr_anneal_steps                                    # 无限模式：如果 lr_anneal_steps 设为 0（默认通常如此），循环将永远运行下去，直到你手动停止。
             or self.step + self.resume_step < self.lr_anneal_steps      # 有限模式：如果你设定了具体lr_anneal_steps（例如 500,000 步），它会计算 当前步数 + 续训步数 是否达到了目标。这对于实施**学习率退火（Learning Rate Annealing）**非常重要，即在达到特定步数后停止训练。
         ):
-            batch, cond = next(self.data)                               # 从数据生成器中获取一个批次的训练数据和对应的条件信息（如果有的话）。
-            self.run_step(batch, cond)                                  # 执行一个训练步骤，包括前向传播、反向传播和优化器更新
+            M_o, P_i, cond = next(self.data)                            # 从数据生成器中获取一个批次的训练数据和对应的条件信息（如果有的话）。
+            self.run_step(M_o, P_i, cond)                               # 执行一个训练步骤，包括前向传播、反向传播和优化器更新
             if self.step % self.log_interval == 0:
                 logger.dumpkvs()                                        # 将训练损失（Loss）、学习率、显存占用等数据写入控制台或磁盘文件（如 CSV 或 TensorBoard）。
             if self.step % self.save_interval == 0:
@@ -177,29 +177,31 @@ class TrainLoop:
         if (self.step - 1) % self.save_interval != 0:
             self.save()
 
-    def run_step(self, batch, cond):
-        self.forward_backward(batch, cond)
+    def run_step(self, M_o, P_i, cond):
+        self.forward_backward(M_o, P_i, cond)
         if self.use_fp16:
             self.optimize_fp16()
         else:
             self.optimize_normal()
         self.log_step()
 
-    def forward_backward(self, batch, cond):
+    def forward_backward(self, M_o, P_i, cond):
         zero_grad(self.model_params)
-        for i in range(0, batch.shape[0], self.microbatch):
-            micro = batch[i : i + self.microbatch].to(dist_util.dev())
+        for i in range(0, M_o.shape[0], self.microbatch):
+            micro_M_o = M_o[i : i + self.microbatch].to(dist_util.dev())
+            micro_P_i = P_i[i : i + self.microbatch].to(dist_util.dev())
             micro_cond = {
                 k: v[i : i + self.microbatch].to(dist_util.dev())
                 for k, v in cond.items()
             }
-            last_batch = (i + self.microbatch) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+            last_batch = (i + self.microbatch) >= M_o.shape[0]
+            t, weights = self.schedule_sampler.sample(micro_M_o.shape[0], dist_util.dev())
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses, # 进行一次前向过程和神经网络预测，计算损失函数，返回一个字典，包含了不同类型的损失（如 "loss", "mse", "vb" 等），这些损失可以用于监控训练过程中的性能和收敛情况
                 self.ddp_model,
-                micro,
+                micro_M_o,
+                micro_P_i,
                 t,
                 model_kwargs=micro_cond,
             )
