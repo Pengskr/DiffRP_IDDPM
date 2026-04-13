@@ -5,7 +5,12 @@ numpy array. This can be used to produce samples for FID evaluation.
 
 import argparse
 import os
-
+import datetime
+# 设置 保存采样地址 的环境变量
+if "OPENAI_LOGDIR" not in os.environ:
+    subdir = datetime.datetime.now().strftime("samples-%Y-%m-%d-%H-%M-%S")
+    os.environ["OPENAI_LOGDIR"] = os.path.join(os.path.expanduser("~/DiffRP_IDDPM/samples"), subdir)
+    
 import numpy as np
 import torch as th
 import torch.distributed as dist
@@ -91,10 +96,10 @@ def main():
 def create_argparser():
     defaults = dict(
         clip_denoised=True,
-        num_samples=10000,
+        num_samples=10,
         batch_size=16,
         use_ddim=True,
-        model_path="",
+        model_path="../my_model_checkpoints/run-2026-04-13-10-28-15/model000100.pt",
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()
