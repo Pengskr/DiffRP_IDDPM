@@ -5,3 +5,4 @@ datasets/cifar_train/
 datasets/cifar_test/
 DiffRP_IDDPM.egg-info/
 my_model_checkpoints/
+samples/
