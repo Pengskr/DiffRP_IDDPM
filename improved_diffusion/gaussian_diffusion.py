@@ -483,6 +483,7 @@ class GaussianDiffusion:
     def ddim_sample(
         self,
         model,
+        M_o,
         x,
         t,
         clip_denoised=True,
@@ -515,9 +516,11 @@ class GaussianDiffusion:
         )
         # Equation 12.
         noise = th.randn_like(x)
+        # print(f'Size of M_o:{M_o.shape}, device:{M_o.device}; size of alpha_bar_prev:{alpha_bar_prev.shape}, device:{alpha_bar_prev.device}')
         mean_pred = (
             out["pred_xstart"] * th.sqrt(alpha_bar_prev)
             + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+            + M_o * th.sqrt(1 - alpha_bar_prev)
         )
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
@@ -566,6 +569,7 @@ class GaussianDiffusion:
     def ddim_sample_loop(
         self,
         model,
+        dataloader_Mo,
         shape,
         noise=None,
         clip_denoised=True,
@@ -583,6 +587,7 @@ class GaussianDiffusion:
         final = None
         for sample in self.ddim_sample_loop_progressive(
             model,
+            dataloader_Mo,
             shape,
             noise=noise,
             clip_denoised=clip_denoised,
@@ -598,6 +603,7 @@ class GaussianDiffusion:
     def ddim_sample_loop_progressive(
         self,
         model,
+        dataloader_Mo,
         shape,
         noise=None,
         clip_denoised=True,
@@ -628,11 +634,14 @@ class GaussianDiffusion:
 
             indices = tqdm(indices)
 
+        M_o, _, _ = next(iter(dataloader_Mo))
+        M_o = M_o.to(next(model.parameters()).device)
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
             with th.no_grad():
                 out = self.ddim_sample(
                     model,
+                    M_o,
                     img,
                     t,
                     clip_denoised=clip_denoised,
