@@ -522,6 +522,7 @@ class GaussianDiffusion:
             out["pred_xstart"] * th.sqrt(alpha_bar_prev)
             + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
             + M_o * th.sqrt(1 - alpha_bar_prev)
+            - M_o * th.sqrt(alpha_bar_prev)/th.sqrt(alpha_bar) * th.sqrt(1 - alpha_bar) # 估算x_0时未考虑M_o
         )
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
@@ -864,7 +865,7 @@ class GaussianDiffusion:
         else:
             res_rgb = res
 
-        plt.figure(figsize=(6, 3)) # 根据生成的拼接图大小调整比例
+        plt.figure(figsize=(8, 9)) # 根据生成的拼接图大小调整比例
         plt.imshow(res_rgb, cmap='gray' if len(res.shape) == 2 or res.shape[2] == 1 else None)
         plt.axis('off') # 隐藏坐标轴
         plt.show()
