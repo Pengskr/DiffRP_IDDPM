@@ -110,6 +110,7 @@ def create_argparser():
     my_config = dict(
         clip_denoised=True,
         num_samples=16,
+        image_size=64,
         batch_size=16,
         use_ddim=True,
         timestep_respacing="ddim20",
