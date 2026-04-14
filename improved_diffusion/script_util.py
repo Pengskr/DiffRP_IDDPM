@@ -112,7 +112,7 @@ def create_model(
         attention_ds.append(image_size // int(res))
 
     return UNetModel(
-        in_channels=1,                                          # 输入图像的通道数，通常为3（RGB图像）  
+        in_channels=2,                                          # 输入图像的通道数，输入为x_t,M_o  
         model_channels=num_channels,                            # mc：模型每一层的基础通道数，乘以channel_mult后得到每一层的实际通道数，中间层的输入输出通道数不变：num_channels * channel_mult[-1]
         out_channels=(1 if not learn_sigma else 2),             # 输出通道数，如果 learn_sigma 为 False，则输出3通道的图像；如果 learn_sigma 为 True，则输出6通道，其中前3通道用于预测图像，后3通道用于预测噪声的方差
         num_res_blocks=num_res_blocks,                          # nr：每个分辨率下的残差块数量  
