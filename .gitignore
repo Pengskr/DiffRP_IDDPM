@@ -6,4 +6,3 @@ datasets/cifar_test/
 datasets/PPD/
 DiffRP_IDDPM.egg-info/
 my_model_checkpoints/
-samples/
