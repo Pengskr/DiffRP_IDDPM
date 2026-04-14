@@ -753,9 +753,9 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
+            terms["mse"] = mean_flat((target - model_output) ** 2)  # 模型预测目标（通常是噪声 $\epsilon$）与真实目标之间的均方误差。这是扩散模型最核心的训练目标
             if "vb" in terms:
-                terms["loss"] = terms["mse"] + terms["vb"]
+                terms["loss"] = terms["mse"] + terms["vb"]          # 模型训练的总目标函数值，如果不学习方差：loss 等于 mse；如果学习方差：loss = mse + vb，这里的 vb 是变分下界（Variational Bound）损失，用于指导模型学习方差。
             else:
                 terms["loss"] = terms["mse"]
         else:
