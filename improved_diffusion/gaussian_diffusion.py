@@ -259,10 +259,17 @@ class GaussianDiffusion:
         """
         if model_kwargs is None:
             model_kwargs = {}
+        
+        if "M_o" in model_kwargs:
+            M_o = model_kwargs.pop("M_o", None)
+            model_input = th.cat([x, M_o], dim=1)
+        else:
+            # 如果没有传，可能报错或回退
+            model_input = x
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        model_output = model(x, self._scale_timesteps(t), **model_kwargs)
+        model_output = model(model_input, self._scale_timesteps(t), **model_kwargs)
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
@@ -497,6 +504,7 @@ class GaussianDiffusion:
 
         Same usage as p_sample().
         """
+        model_kwargs = {"M_o": M_o}
         out = self.p_mean_variance(
             model,
             x,
@@ -721,7 +729,8 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs) # 神经网络预测：Unet的输出，可能是噪声epsilon或x_0和可学习方差(learn_sigma=True)
+            model_input = th.cat([x_t, M_o], dim=1) # 结果为 [Batch, 2, H, W]
+            model_output = model(model_input, self._scale_timesteps(t), **model_kwargs) # 神经网络预测：Unet的输出，可能是噪声epsilon或x_0和可学习方差(learn_sigma=True)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
