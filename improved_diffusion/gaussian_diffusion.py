@@ -127,11 +127,13 @@ class GaussianDiffusion:
         model_var_type,
         loss_type,
         rescale_timesteps=False,
+        biased_initialization=False,
     ):
         self.model_mean_type = model_mean_type  # 如果 predict_xstart 为 False，则模型预测噪声 epsilon；如果 predict_xstart 为 True，则模型直接预测原始图像 x_0，这两种方式在训练和采样过程中会有不同的表现和效果
         self.model_var_type = model_var_type
         self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
+        self.biased_initialization = 1.0 if biased_initialization else 0.0
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -206,7 +208,7 @@ class GaussianDiffusion:
         assert noise.shape == x_start.shape
         return (
             _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * M_o
+            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * M_o * self.biased_initialization
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
@@ -529,8 +531,8 @@ class GaussianDiffusion:
         mean_pred = (
             out["pred_xstart"] * th.sqrt(alpha_bar_prev)
             + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
-            + M_o * th.sqrt(1 - alpha_bar_prev)
-            - M_o * th.sqrt(alpha_bar_prev)/th.sqrt(alpha_bar) * th.sqrt(1 - alpha_bar) # 估算x_0时未考虑M_o
+            + M_o * th.sqrt(1 - alpha_bar_prev) * self.biased_initialization
+            - M_o * th.sqrt(alpha_bar_prev)/th.sqrt(alpha_bar) * th.sqrt(1 - alpha_bar) * self.biased_initialization    # 估算x_0时未考虑M_o
         )
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
