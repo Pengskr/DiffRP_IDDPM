@@ -40,7 +40,7 @@ class PairedImageDataset(Dataset):
         # 返回成对的张量
         return img_a, img_b, {}
 
-def get_dataloader(root_folder_data, folder_Mo, folder_P, num_images, batch_size, image_size):
+def get_dataloader(root_folder_data, folder_Mo, folder_P, num_images, batch_size, image_size, shuffle = True):
     data_transform = Compose([
         Resize((image_size, image_size)),
         ToTensor(),
@@ -63,7 +63,7 @@ def get_dataloader(root_folder_data, folder_Mo, folder_P, num_images, batch_size
         print("警告：数据集为空，请检查路径！")
     
     # 初始化 DataLoader
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=4)
 
     return dataloader
 
