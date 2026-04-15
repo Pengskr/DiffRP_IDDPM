@@ -6,6 +6,7 @@ import blobfile as bf
 import numpy as np
 import torch as th
 import torch.distributed as dist
+import matplotlib.pyplot as plt
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 
@@ -32,6 +33,8 @@ class TrainLoop:
         *,
         model,
         diffusion,
+        sample_diffusion,
+        sample_M_o,
         data,
         batch_size,
         microbatch,
@@ -48,6 +51,8 @@ class TrainLoop:
     ):
         self.model = model
         self.diffusion = diffusion
+        self.sample_diffusion = sample_diffusion
+        self.sample_M_o = sample_M_o
         self.data = data
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
@@ -69,6 +74,10 @@ class TrainLoop:
         self.step = 0
         self.resume_step = 0    # 断点续传步数
         self.global_batch = self.batch_size * dist.get_world_size()
+
+        # 新增：用于绘图的历史记录
+        self.mse_history = []
+        self.step_history = []
 
         self.model_params = list(self.model.parameters())
         self.master_params = self.model_params
@@ -166,9 +175,20 @@ class TrainLoop:
             M_o, P_i, cond = next(self.data)                            # 从数据生成器中获取一个批次的训练数据和对应的条件信息（如果有的话）。
             self.run_step(M_o, P_i, cond)                               # 执行一个训练步骤，包括前向传播、反向传播和优化器更新
             if self.step % self.log_interval == 0:
-                logger.dumpkvs()                                        # 将训练损失（Loss）、学习率、显存占用等数据写入控制台或磁盘文件（如 CSV 或 TensorBoard）。
+                report = logger.dumpkvs()                               # 将训练损失（Loss）、学习率、显存占用等数据写入控制台或磁盘文件（如 CSV 或 TensorBoard）。
+                if "mse" in report:
+                    self.mse_history.append(report["mse"])
+                    self.step_history.append(self.step + self.resume_step)
+                    # 仅在主进程（rank 0）绘制，避免分布式训练时重复绘图
+                    if dist.get_rank() == 0:
+                        self.plot_mse(self.step + self.resume_step)
             if self.step % self.save_interval == 0:
                 self.save()                                             # 每隔 save_interval 步，保存模型检查点。
+
+                # 新增：在保存模型时进行一次采样观察
+                if dist.get_rank() == 0:
+                    self.log_samples(self.sample_M_o) # 使用当前 batch 的地图作为条件
+
                 # Run for a finite amount of time in integration tests.
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
@@ -176,6 +196,60 @@ class TrainLoop:
         # Save the last checkpoint if it wasn't already saved.
         if (self.step - 1) % self.save_interval != 0:
             self.save()
+
+    def plot_mse(self, step):
+        # 简单的绘图逻辑
+        plt.plot(self.step_history, self.mse_history, label='Train MSE')
+        plt.xlabel('Step')
+        plt.ylabel('MSE')
+        plt.title('MSE vs. Training Step')
+        plt.legend()
+        plt.grid(True)
+        
+        # 将图片保存到当前的日志目录
+        plot_path = os.path.join(get_blob_logdir(), f"mse_curve_{step}.png")
+        plt.savefig(plot_path)
+        plt.close()  # 及时关闭以释放内存
+
+    # 在 TrainLoop 类中新增方法
+    def log_samples(self, M_o):
+        self.model.eval() # 切换到评估模式
+        with th.no_grad():
+            # 准备采样参数
+            sample_shape = (M_o.shape[0], M_o.shape[1], M_o.shape[2], M_o.shape[3])
+                        
+            # 使用 DDIM 采样（通常比原本的 p_sample 快）
+            model_kwargs = {}
+            sample = self.sample_diffusion.ddim_sample_loop(
+                self.model,
+                M_o.to(dist_util.dev()), 
+                sample_shape,
+                clip_denoised=True,
+                model_kwargs=model_kwargs,
+                device=dist_util.dev(),
+            )
+            
+            # 简单的可视化处理
+            sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            sample = sample.cpu().numpy()
+            
+            # 拼接并保存图片
+            import matplotlib.pyplot as plt
+            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+            # 绘制地图
+            axes[0].imshow(M_o[0, 0].cpu().numpy(), cmap='gray')
+            axes[0].set_title("Input Map (M_o)")
+            # 绘制生成的路径
+            axes[1].imshow(sample[0, 0], cmap='gray')
+            axes[1].set_title(f"Generated Path (Step {self.step + self.resume_step})")
+            
+            for ax in axes: ax.axis('off')
+            
+            out_path = os.path.join(get_blob_logdir(), f"sample_{self.step + self.resume_step:06d}.png")
+            plt.savefig(out_path)
+            plt.close()
+
+        self.model.train() # 恢复到训练模式
 
     def run_step(self, M_o, P_i, cond):
         self.forward_backward(M_o, P_i, cond)
