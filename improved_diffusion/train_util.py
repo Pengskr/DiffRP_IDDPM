@@ -179,12 +179,10 @@ class TrainLoop:
                 if "mse" in report:
                     self.mse_history.append(report["mse"])
                     self.step_history.append(self.step + self.resume_step)
-                    # 仅在主进程（rank 0）绘制，避免分布式训练时重复绘图
                     if dist.get_rank() == 0:
                         self.plot_mse(self.step + self.resume_step)
             if self.step % self.save_interval == 0:
                 self.save()                                             # 每隔 save_interval 步，保存模型检查点。
-
                 # 新增：在保存模型时进行一次采样观察
                 if dist.get_rank() == 0:
                     self.log_samples(self.sample_M_o) # 使用当前 batch 的地图作为条件

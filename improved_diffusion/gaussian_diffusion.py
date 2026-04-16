@@ -856,7 +856,7 @@ class GaussianDiffusion:
     
     def extract_forward(self, dataloader_P, device, n_steps, noise=None):
         device = device
-        M_o, P_i, _ = next(iter(dataloader_P))
+        M_o, P_i, _, _ = next(iter(dataloader_P))
         P_i = P_i.to(device)
         M_o = M_o.to(device)
 
