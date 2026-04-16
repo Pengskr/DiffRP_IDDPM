@@ -35,6 +35,7 @@ class TrainLoop:
         diffusion,
         sample_diffusion,
         sample_M_o,
+        sample_P,
         data,
         batch_size,
         microbatch,
@@ -52,7 +53,8 @@ class TrainLoop:
         self.model = model
         self.diffusion = diffusion
         self.sample_diffusion = sample_diffusion
-        self.sample_M_o = sample_M_o
+        self.sample_M_o = sample_M_o.to(dist_util.dev())
+        self.sample_P = sample_P.to(dist_util.dev())
         self.data = data
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
@@ -77,6 +79,8 @@ class TrainLoop:
 
         # 新增：用于绘图的历史记录
         self.mse_history = []
+        self.test_loss_history = []      # 新增：model 测试损失
+        self.ema_test_loss_history = []  # 新增：ema_model 测试损失
         self.step_history = []
 
         self.model_params = list(self.model.parameters())
@@ -172,20 +176,39 @@ class TrainLoop:
             not self.lr_anneal_steps                                    # 无限模式：如果 lr_anneal_steps 设为 0（默认通常如此），循环将永远运行下去，直到你手动停止。
             or self.step + self.resume_step < self.lr_anneal_steps      # 有限模式：如果你设定了具体lr_anneal_steps（例如 500,000 步），它会计算 当前步数 + 已训步数 是否达到了目标。
         ):
-            M_o, P_i, cond = next(self.data)                            # 从数据生成器中获取一个批次的训练数据和对应的条件信息（如果有的话）。
+            M_o, P_i, cond, _ = next(self.data)                            # 从数据生成器中获取一个批次的训练数据和对应的条件信息（如果有的话）。
             self.run_step(M_o, P_i, cond)                               # 执行一个训练步骤，包括前向传播、反向传播和优化器更新
             if self.step % self.log_interval == 0:
-                report = logger.dumpkvs()                               # 将训练损失（Loss）、学习率、显存占用等数据写入控制台或磁盘文件（如 CSV 或 TensorBoard）。
-                if "mse" in report:
-                    self.mse_history.append(report["mse"])
+                # 仅在主进程计算测试损失，避免多卡重复计算耗时
+                if dist.get_rank() == 0:
+                    # 计算当前模型和 EMA 模型的测试损失
+                    t_loss = self.calculate_test_loss(use_ema=False)
+                    ema_t_loss = self.calculate_test_loss(use_ema=True)
+                    logger.logkv("test_loss", t_loss)
+                    logger.logkv("ema_test_loss", ema_t_loss)
+                
+                # 统一转储 (此时缓冲区包含训练 mse, step, samples, 以及刚刚存入的 test_loss)
+                report = logger.dumpkvs()
+
+                # 更新绘图历史记录 (从 report 中提取已平均或记录的值)
+                if dist.get_rank() == 0:
                     self.step_history.append(self.step + self.resume_step)
-                    if dist.get_rank() == 0:
-                        self.plot_mse(self.step + self.resume_step)
+                    
+                    if "mse" in report:
+                        self.mse_history.append(report["mse"])
+                    if "test_loss" in report:
+                        self.test_loss_history.append(report["test_loss"])
+                    if "ema_test_loss" in report:
+                        self.ema_test_loss_history.append(report["ema_test_loss"])
+                    
+                    # 绘制曲线
+                    self.plot_metrics(self.step + self.resume_step)
+
             if self.step % self.save_interval == 0:
                 self.save()                                             # 每隔 save_interval 步，保存模型检查点。
-                # 新增：在保存模型时进行一次采样观察
+                # 在保存模型时进行一次采样观察
                 if dist.get_rank() == 0:
-                    self.log_samples(self.sample_M_o) # 使用当前 batch 的地图作为条件
+                    self.log_samples(self.sample_M_o, self.sample_P) # 使用当前 batch 的地图作为条件
 
                 # Run for a finite amount of time in integration tests.
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
@@ -195,56 +218,128 @@ class TrainLoop:
         if (self.step - 1) % self.save_interval != 0:
             self.save()
 
-    def plot_mse(self, step):
-        # 简单的绘图逻辑
-        plt.plot(self.step_history, self.mse_history, label='Train MSE')
-        plt.xlabel('Step')
-        plt.ylabel('MSE')
-        plt.title('MSE vs. Training Step')
-        plt.legend()
-        plt.grid(True)
+    def calculate_test_loss(self, use_ema=False):
+        """计算生成的路径 P 与真实路径 sample_P 的相似度损失 (MSE)"""
+        self.model.eval()
         
-        # 将图片保存到当前的日志目录
-        plot_path = os.path.join(get_blob_logdir(), f"mse_curve_{step}.png")
+        # 如果使用 EMA，暂时替换参数
+        if use_ema:
+            online_backup = [p.data.clone() for p in self.model.parameters()]
+            self._load_ema_to_model()   
+            
+        with th.no_grad():
+            # 使用 DDIM 采样生成路径
+            model_kwargs = {}
+            gen_P = self.sample_diffusion.ddim_sample_loop(
+                self.model,
+                self.sample_M_o,
+                self.sample_P.shape,
+                clip_denoised=True,
+                model_kwargs=model_kwargs,
+                device=dist_util.dev(),
+            )
+            # 计算路径相似度损失 (MSE)
+            loss_tensor = self.sample_diffusion.loss_path_similarity(self.sample_P, gen_P)
+            loss = loss_tensor.mean().detach().cpu().item()
+
+        # 恢复原始参数
+        if use_ema:
+            for p, backup_val in zip(self.model.parameters(), online_backup):
+                p.data.copy_(backup_val)
+                
+        self.model.train()
+        return loss
+
+    def _load_ema_to_model(self):
+        """辅助方法：将 EMA 参数加载到当前模型中"""
+        for p, ema_p in zip(self.model.parameters(), self.ema_params[0]):
+            p.data.copy_(ema_p.data)    # 直接在原地修改张量的数值，而不破坏计算图
+
+    def plot_metrics(self, step):
+        """更新后的绘图函数，展示训练和测试对比"""
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.step_history, self.mse_history, label='Train Loss (MSE: Epsilon+Path)', alpha=0.6)
+        plt.plot(self.step_history, self.test_loss_history, label='Test Loss (Model)', linewidth=2)
+        plt.plot(self.step_history, self.ema_test_loss_history, label='Test Loss (EMA)', linewidth=2, linestyle='--')
+        
+        plt.xlabel('Step')
+        plt.ylabel('Loss/MSE')
+        plt.title(f'Training Progress (Step {step})')
+        plt.legend()
+        plt.yscale('log') # 路径损失通常较小，建议用对数坐标
+        plt.grid(True, which="both", ls="-", alpha=0.5)
+        
+        plot_path = os.path.join(get_blob_logdir(), f"metrics_curve_{step}.png")
         plt.savefig(plot_path)
-        plt.close()  # 及时关闭以释放内存
+        plt.close()         
 
     # 在 TrainLoop 类中新增方法
-    def log_samples(self, M_o):
+    def log_samples(self, M_o, P):
         self.model.eval() # 切换到评估模式
-        with th.no_grad():
-            # 准备采样参数
-            sample_shape = (M_o.shape[0], M_o.shape[1], M_o.shape[2], M_o.shape[3])
-                        
-            # 使用 DDIM 采样（通常比原本的 p_sample 快）
+        with th.no_grad():                       
+            batch_size = M_o.shape[0]
+            sets_per_row = 4  # 每行显示 4 组
+            num_cols_per_set = 3 # 每组包含 3 张图 (M_o, P, Sample)
+            num_rows = (batch_size + sets_per_row - 1) // sets_per_row
+            num_cols = sets_per_row * num_cols_per_set # 总列数为 12
+            
+            # 使用 DDIM 采样生成路径
             model_kwargs = {}
             sample = self.sample_diffusion.ddim_sample_loop(
                 self.model,
                 M_o.to(dist_util.dev()), 
-                sample_shape,
+                M_o.shape,
                 clip_denoised=True,
                 model_kwargs=model_kwargs,
                 device=dist_util.dev(),
             )
             
-            # 简单的可视化处理
-            sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
-            sample = sample.cpu().numpy()
+            # 可视化前处理：恢复到 0-255 像素范围并转为 Numpy
+            sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8).cpu().numpy()
+            M_o_cpu = M_o.cpu().numpy()
+            # 同样处理真实路径 P
+            P_cpu = ((P + 1) * 127.5).clamp(0, 255).to(th.uint8).cpu().numpy()
             
-            # 拼接并保存图片
+            # 创建画布：宽设为 12 列，高根据行数动态调整
             import matplotlib.pyplot as plt
-            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-            # 绘制地图
-            axes[0].imshow(M_o[0, 0].cpu().numpy(), cmap='gray')
-            axes[0].set_title("Input Map (M_o)")
-            # 绘制生成的路径
-            axes[1].imshow(sample[0, 0], cmap='gray')
-            axes[1].set_title(f"Generated Path (Step {self.step + self.resume_step})")
+            fig, axes = plt.subplots(num_rows, num_cols, figsize=(num_cols * 1.5, num_rows * 2.5))
             
-            for ax in axes: ax.axis('off')
+            # 确保 axes 始终是 2D 数组方便索引 [row, col]
+            if num_rows == 1:
+                axes = axes[None, :]
             
-            out_path = os.path.join(get_blob_logdir(), f"sample_{self.step + self.resume_step:06d}.png")
-            plt.savefig(out_path)
+            for i in range(batch_size):
+                row = i // sets_per_row
+                set_idx = i % sets_per_row
+                col_start = set_idx * num_cols_per_set
+                
+                # 1. 绘制地图 M_o
+                ax_mo = axes[row, col_start]
+                ax_mo.imshow(M_o_cpu[i, 0], cmap='gray')
+                ax_mo.axis('off')
+                if row == 0: ax_mo.set_title("M_o", fontsize=8)
+                
+                # 2. 绘制真实路径 P
+                ax_p = axes[row, col_start + 1]
+                ax_p.imshow(P_cpu[i, 0], cmap='gray')
+                ax_p.axis('off')
+                if row == 0: ax_p.set_title("P (GT)", fontsize=8)
+                
+                # 3. 绘制生成路径 Sample
+                ax_s = axes[row, col_start + 2]
+                ax_s.imshow(sample[i, 0], cmap='gray')
+                ax_s.axis('off')
+                if row == 0: ax_s.set_title("Sample", fontsize=8)
+            
+            # 隐藏多余的空白子图
+            for i in range(batch_size * num_cols_per_set, num_rows * num_cols):
+                r, c = divmod(i, num_cols)
+                axes[r, c].axis('off')
+            
+            plt.tight_layout(pad=0.5)
+            
+            out_path = os.path.join(get_blob_logdir(), f"batch_sample_{self.step + self.resume_step:06d}.png")
+            plt.savefig(out_path, dpi=150)
             plt.close()
 
         self.model.train() # 恢复到训练模式
