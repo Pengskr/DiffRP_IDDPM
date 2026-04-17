@@ -10,9 +10,10 @@ from torch.utils.data import DataLoader
 
 
 class PairedImageDataset(Dataset):
-    def __init__(self, root_dir, folder_a, folder_b, num_images, transform=None, threshold=0.99):
+    def __init__(self, root_dir, folder_a, folder_b, Path_inverse, num_images, transform=None, threshold=0.99):
         self.dir_a = root_dir / folder_a
         self.dir_b = root_dir / folder_b
+        self.Path_inverse = Path_inverse
         self.transform = transform
         self.extension = ".jpg" 
         self.num_images = num_images
@@ -38,13 +39,16 @@ class PairedImageDataset(Dataset):
             img_c = self.transform(img_c)
         
         img_a = (img_a > self.threshold).float() * 2 - 1
-        img_b = (img_b <= self.threshold).float() * 2 - 1   # img_b 反相：原本 > threshold 的部分变 -1，原本 <= threshold 的部分变 1
+        if self.Path_inverse:
+            img_b = (img_b <= self.threshold).float() * 2 - 1   # img_b 反相：原本 > threshold 的部分变 -1，原本 <= threshold 的部分变 1
+        else:
+            img_b = (img_b > self.threshold).float() * 2 - 1
         img_c = img_c * 2.0 - 1.0
         
         # 返回成对的张量
         return img_a, img_c, img_b, {}, img_name    # M_o, M_r, P, cond, img_name
 
-def get_dataloader(root_folder_data, folder_Mo, folder_P, num_images, batch_size, image_size, shuffle = True):
+def get_dataloader(root_folder_data, folder_Mo, folder_P, Path_inverse, num_images, batch_size, image_size, shuffle = True):
     data_transform = Compose([
         Resize((image_size, image_size), interpolation=InterpolationMode.NEAREST),
         ToTensor(),
@@ -53,8 +57,9 @@ def get_dataloader(root_folder_data, folder_Mo, folder_P, num_images, batch_size
         root_folder_data,
         folder_Mo,
         folder_P,
+        Path_inverse,
         num_images=num_images,
-        transform=data_transform,   # Path有反相
+        transform=data_transform,
         threshold=0.9
     )
     if len(dataset) > 0:
