@@ -34,6 +34,7 @@ class TrainLoop:
         model,
         diffusion,
         sample_diffusion,
+        Path_inverse,
         sample_Mo,
         sample_Mr,
         sample_P,
@@ -54,6 +55,7 @@ class TrainLoop:
         self.model = model
         self.diffusion = diffusion
         self.sample_diffusion = sample_diffusion
+        self.Path_inverse = Path_inverse
         self.sample_Mo = sample_Mo.to(dist_util.dev())
         self.sample_Mr = sample_Mr.to(dist_util.dev())
         self.sample_P = sample_P.to(dist_util.dev())
@@ -83,6 +85,8 @@ class TrainLoop:
         self.mse_history = []
         self.test_loss_history = []      # 新增：model 测试损失
         self.ema_test_loss_history = []  # 新增：ema_model 测试损失
+        self.F1_history = []
+        self.F1_EMA_history = []
         self.step_history = []
 
         self.model_params = list(self.model.parameters())
@@ -178,80 +182,133 @@ class TrainLoop:
             not self.lr_anneal_steps                                    # 无限模式：如果 lr_anneal_steps 设为 0（默认通常如此），循环将永远运行下去，直到你手动停止。
             or self.step + self.resume_step < self.lr_anneal_steps      # 有限模式：如果你设定了具体lr_anneal_steps（例如 500,000 步），它会计算 当前步数 + 已训步数 是否达到了目标。
         ):
-            M_o, M_r, P_i, cond, _ = next(self.data)                         # 从数据生成器中获取一个批次的训练数据和对应的条件信息（如果有的话）。
-            self.run_step(M_o, M_r, P_i, cond)                               # 执行一个训练步骤，包括前向传播、反向传播和优化器更新
+            M_o, M_r, P_i, cond, _ = next(self.data)                    # 从数据生成器中获取一个批次的训练数据和对应的条件信息（如果有的话）。
+            self.run_step(M_o, M_r, P_i, cond)                          # 执行一个训练步骤，包括前向传播、反向传播和优化器更新
             if self.step % self.log_interval == 0:
-                # 仅在主进程计算测试损失，避免多卡重复计算耗时
                 if dist.get_rank() == 0:
-                    # 计算当前模型和 EMA 模型的测试损失
-                    t_loss = self.calculate_test_loss(use_ema=False)
-                    ema_t_loss = self.calculate_test_loss(use_ema=True)
-                    logger.logkv("test_loss", t_loss)
-                    logger.logkv("ema_test_loss", ema_t_loss)
+                    gen_P, t_loss, f1 = self.evaluate_and_sample(use_ema=False)
+                    ema_gen_P, ema_t_loss, ema_f1 = self.evaluate_and_sample(use_ema=True)
+                    self.save_comparison_image(M_r, P_i, gen_P, ema_gen_P)
+                    
+                    self.test_loss_history.append(t_loss)
+                    self.ema_test_loss_history.append(ema_t_loss)
+                    self.F1_history.append(f1)
+                    self.F1_EMA_history.append(ema_f1)
                 
                 # 统一转储 (此时缓冲区包含训练 mse, step, samples, 以及刚刚存入的 test_loss)
                 report = logger.dumpkvs()
-
-                # 更新绘图历史记录 (从 report 中提取已平均或记录的值)
                 if dist.get_rank() == 0:
                     self.step_history.append(self.step + self.resume_step)
-                    
                     if "mse" in report:
                         self.mse_history.append(report["mse"])
-                    if "test_loss" in report:
-                        self.test_loss_history.append(report["test_loss"])
-                    if "ema_test_loss" in report:
-                        self.ema_test_loss_history.append(report["ema_test_loss"])
-                    
-                    # 绘制曲线
                     self.plot_metrics(self.step + self.resume_step)
 
             if self.step % self.save_interval == 0:
                 self.save()                                             # 每隔 save_interval 步，保存模型检查点。
-                # 在保存模型时进行一次采样观察
-                if dist.get_rank() == 0:
-                    self.log_samples(self.sample_Mo, self.sample_Mr, self.sample_P) # 使用当前 batch 的地图作为条件
-
                 # Run for a finite amount of time in integration tests.
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
             self.step += 1
-        # Save the last checkpoint if it wasn't already saved.
+            
         if (self.step - 1) % self.save_interval != 0:
             self.save()
-
-    def calculate_test_loss(self, use_ema=False):
-        """计算生成的路径 P 与真实路径 sample_P 的相似度损失 (MSE)"""
+    
+    def evaluate_and_sample(self, use_ema=False):
         self.model.eval()
         
-        # 如果使用 EMA，暂时替换参数
+        # 1. EMA 参数处理
+        online_backup = None
         if use_ema:
             online_backup = [p.data.clone() for p in self.model.parameters()]
-            self._load_ema_to_model()   
-            
+            self._load_ema_to_model()
+
         with th.no_grad():
-            # 使用 DDIM 采样生成路径
-            model_kwargs = {}
+            # 2. 执行采样 (最耗时的部分，只跑一次)
             gen_P = self.sample_diffusion.ddim_sample_loop(
                 self.model,
                 self.sample_Mo,
                 self.sample_Mr,
                 self.sample_P.shape,
                 clip_denoised=True,
-                model_kwargs=model_kwargs,
                 device=dist_util.dev(),
             )
-            # 计算路径相似度损失 (MSE)
-            loss_tensor = self.sample_diffusion.loss_path_similarity(self.sample_P, gen_P)
-            loss = loss_tensor.mean().detach().cpu().item()
+            
+            # 3. 计算指标
+            loss = self.sample_diffusion.loss_path_similarity(self.sample_P, gen_P).mean().item()
+            f1 = self.sample_diffusion.compute_F1_score(self.sample_P, gen_P, self.Path_inverse)
+            
+            # 记录到日志系统
+            suffix = "(EMA)" if use_ema else ""
+            logger.logkv(f"test_loss{suffix}", loss)
+            logger.logkv(f"F1{suffix}", f1)
 
-        # 恢复原始参数
+        # 4. 恢复原始参数
         if use_ema:
             for p, backup_val in zip(self.model.parameters(), online_backup):
                 p.data.copy_(backup_val)
-                
+        
         self.model.train()
-        return loss
+        
+        # 返回生成结果
+        return gen_P, loss, f1
+
+    def save_comparison_image(self, M_r, P, sample, ema_sample):
+
+        batch_size = M_r.shape[0]
+        sets_per_row = 4      # 每行显示 4 组
+        num_cols_per_set = 4  # 每组包含 4 张图 (Mr, P, Sample, EMA_Sample)
+        num_rows = (batch_size + sets_per_row - 1) // sets_per_row
+        num_cols = sets_per_row * num_cols_per_set # 总列数为 16
+
+        sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8).cpu().numpy()
+        ema_sample = ((ema_sample + 1) * 127.5).clamp(0, 255).to(th.uint8).cpu().numpy()
+        M_r_cpu = ((M_r + 1) * 127.5).clamp(0, 255).to(th.uint8).cpu().numpy()
+        P_cpu = ((P + 1) * 127.5).clamp(0, 255).to(th.uint8).cpu().numpy()
+
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(num_rows, num_cols, figsize=(num_cols * 1.5, num_rows * 2.5))
+        
+        if num_rows == 1:
+            axes = axes[None, :]
+        
+        for i in range(batch_size):
+            row = i // sets_per_row
+            set_idx = i % sets_per_row
+            col_start = set_idx * num_cols_per_set
+            
+            # 第一列：地图 M_r
+            ax_mr = axes[row, col_start]
+            ax_mr.imshow(M_r_cpu[i].transpose(1, 2, 0))
+            ax_mr.axis('off')
+            if row == 0: ax_mr.set_title("M_r", fontsize=8)
+            
+            # 第二列：真实路径 P
+            ax_p = axes[row, col_start + 1]
+            ax_p.imshow(P_cpu[i, 0], cmap='gray')
+            ax_p.axis('off')
+            if row == 0: ax_p.set_title("P (GT)", fontsize=8)
+            
+            # 第三列：Model 生成路径
+            ax_s = axes[row, col_start + 2]
+            ax_s.imshow(sample[i, 0], cmap='gray')
+            ax_s.axis('off')
+            if row == 0: ax_s.set_title("Model", fontsize=8)
+
+            # 第四列：EMA Model 生成路径
+            ax_ema = axes[row, col_start + 3]
+            ax_ema.imshow(ema_sample[i, 0], cmap='gray')
+            ax_ema.axis('off')
+            if row == 0: ax_ema.set_title("EMA Model", fontsize=8)
+        
+        # 隐藏空白子图
+        for i in range(batch_size * num_cols_per_set, num_rows * num_cols):
+            r, c = divmod(i, num_cols)
+            axes[r, c].axis('off')
+        
+        plt.tight_layout(pad=0.5)
+        out_path = os.path.join(get_blob_logdir(), f"batch_sample_{self.step + self.resume_step:06d}.png")
+        plt.savefig(out_path, dpi=150)
+        plt.close()
 
     def _load_ema_to_model(self):
         """辅助方法：将 EMA 参数加载到当前模型中"""
@@ -259,94 +316,45 @@ class TrainLoop:
             p.data.copy_(ema_p.data)    # 直接在原地修改张量的数值，而不破坏计算图
 
     def plot_metrics(self, step):
-        """更新后的绘图函数，展示训练和测试对比"""
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.step_history, self.mse_history, label='Train Loss (MSE: Epsilon+Path)', alpha=0.6)
-        plt.plot(self.step_history, self.test_loss_history, label='Test Loss (Model)', linewidth=2)
-        plt.plot(self.step_history, self.ema_test_loss_history, label='Test Loss (EMA)', linewidth=2, linestyle='--')
+        """更新后的绘图函数，左侧显示 Loss，右侧显示 F1-score"""
+        # 创建 1 行 2 列的子图布局
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
         
-        plt.xlabel('Step')
-        plt.ylabel('Loss/MSE')
-        plt.title(f'Training Progress (Step {step})')
-        plt.legend()
-        plt.yscale('log') # 路径损失通常较小，建议用对数坐标
-        plt.grid(True, which="both", ls="-", alpha=0.5)
+        # --- 左图：绘制 Loss 相关指标 ---
+        ax1.plot(self.step_history, self.mse_history, label='Train Loss (MSE)', alpha=0.4)
+        ax1.plot(self.step_history, self.test_loss_history, label='Test Loss (Model)', linewidth=2)
+        ax1.plot(self.step_history, self.ema_test_loss_history, label='Test Loss (EMA)', linewidth=2, linestyle='--')
         
+        ax1.set_xlabel('Step')
+        ax1.set_ylabel('Loss/MSE')
+        ax1.set_title('Loss Metrics')
+        ax1.legend()
+        ax1.set_yscale('log')  # Loss 通常建议使用对数坐标
+        ax1.grid(True, which="both", ls="-", alpha=0.3)
+
+        # --- 右图：绘制 F1-score ---
+        ax2.plot(self.step_history, self.F1_history, label='F1 (Model)', color='green', linewidth=2)
+        ax2.plot(self.step_history, self.F1_EMA_history, label='F1 (EMA)', color='darkgreen', linewidth=2, linestyle='--')
+        
+        ax2.set_xlabel('Step')
+        ax2.set_ylabel('F1')
+        ax2.set_title('F1')
+        ax2.legend()
+        # F1 值范围在 0-1，通常使用线性坐标，并锁定 y 轴范围
+        ax2.set_ylim(0, 1.05) 
+        ax2.grid(True, ls="-", alpha=0.3)
+
+        # 整体标题
+        plt.suptitle(f'Training Progress (Step {step})', fontsize=16)
+        
+        # 自动调整布局，防止子图重叠
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # 保存并关闭
         plot_path = os.path.join(get_blob_logdir(), f"metrics_curve_{step}.png")
         plt.savefig(plot_path)
         plt.close()         
 
-    # 在 TrainLoop 类中新增方法
-    def log_samples(self, M_o, M_r, P):
-        self.model.eval() # 切换到评估模式
-        with th.no_grad():                       
-            batch_size = M_o.shape[0]
-            sets_per_row = 4  # 每行显示 4 组
-            num_cols_per_set = 3 # 每组包含 3 张图 (M_o, P, Sample)
-            num_rows = (batch_size + sets_per_row - 1) // sets_per_row
-            num_cols = sets_per_row * num_cols_per_set # 总列数为 12
-            
-            # 使用 DDIM 采样生成路径
-            model_kwargs = {}
-            sample = self.sample_diffusion.ddim_sample_loop(
-                self.model,
-                M_o.to(dist_util.dev()), 
-                M_r.to(dist_util.dev()), 
-                M_o.shape,
-                clip_denoised=True,
-                model_kwargs=model_kwargs,
-                device=dist_util.dev(),
-            )
-            
-            # 可视化前处理：恢复到 0-255 像素范围并转为 Numpy
-            sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8).cpu().numpy()
-            M_r_cpu = ((M_r + 1) * 127.5).clamp(0, 255).to(th.uint8).cpu().numpy()
-            # 同样处理真实路径 P
-            P_cpu = ((P + 1) * 127.5).clamp(0, 255).to(th.uint8).cpu().numpy()
-            
-            # 创建画布：宽设为 12 列，高根据行数动态调整
-            import matplotlib.pyplot as plt
-            fig, axes = plt.subplots(num_rows, num_cols, figsize=(num_cols * 1.5, num_rows * 2.5))
-            
-            # 确保 axes 始终是 2D 数组方便索引 [row, col]
-            if num_rows == 1:
-                axes = axes[None, :]
-            
-            for i in range(batch_size):
-                row = i // sets_per_row
-                set_idx = i % sets_per_row
-                col_start = set_idx * num_cols_per_set
-                
-                # 1. 绘制地图 M_r
-                ax_mr = axes[row, col_start]
-                ax_mr.imshow(M_r_cpu[i].transpose(1, 2, 0)) # 注意：这里不需要 cmap='gray'
-                if row == 0: ax_mr.set_title("M_r to model", fontsize=8)
-                ax_mr.axis('off')                
-                
-                # 2. 绘制真实路径 P
-                ax_p = axes[row, col_start + 1]
-                ax_p.imshow(P_cpu[i, 0], cmap='gray')
-                ax_p.axis('off')
-                if row == 0: ax_p.set_title("P (GT)", fontsize=8)
-                
-                # 3. 绘制生成路径 Sample
-                ax_s = axes[row, col_start + 2]
-                ax_s.imshow(sample[i, 0], cmap='gray')
-                ax_s.axis('off')
-                if row == 0: ax_s.set_title("Sample", fontsize=8)
-            
-            # 隐藏多余的空白子图
-            for i in range(batch_size * num_cols_per_set, num_rows * num_cols):
-                r, c = divmod(i, num_cols)
-                axes[r, c].axis('off')
-            
-            plt.tight_layout(pad=0.5)
-            
-            out_path = os.path.join(get_blob_logdir(), f"batch_sample_{self.step + self.resume_step:06d}.png")
-            plt.savefig(out_path, dpi=150)
-            plt.close()
-
-        self.model.train() # 恢复到训练模式
 
     def run_step(self, M_o, M_r, P_i, cond):
         self.forward_backward(M_o, M_r, P_i, cond)
@@ -455,7 +463,8 @@ class TrainLoop:
                     # filename = f"model{(self.step+self.resume_step):06d}.pt"
                     filename = f"model.pt"
                 else:
-                    filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt"
+                    # filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt"
+                    filename = f"model_ema.pt"
                 with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
                     th.save(state_dict, f)
 
