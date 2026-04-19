@@ -5,8 +5,10 @@ https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0
 """
 
 import numpy as np
-
 import torch as th
+import torch.nn.functional as F
+
+from .nn import mean_flat
 
 
 def normal_kl(mean1, logvar1, mean2, logvar2):
@@ -75,3 +77,40 @@ def discretized_gaussian_log_likelihood(x, *, means, log_scales):
     )
     assert log_probs.shape == x.shape
     return log_probs
+
+
+def loss_path_similarity(weight_path_similarity, x_start, pred_xstart):
+    return weight_path_similarity * mean_flat((x_start - pred_xstart) ** 2)
+
+def compute_F1_score(target, pred, Path_inverse=False, thresh_hold=0.0):
+    """
+    Args:
+        path_inverse (bool): 如果为 True, 则 -1 是路径；如果为 False, 则 1 是路径。
+    """
+    # # 允许 1-2 像素的误差
+    # target = F.max_pool2d(target, kernel_size=3, stride=1, padding=1)
+    # pred   = F.max_pool2d(pred, kernel_size=3, stride=1, padding=1)
+    
+    # 动态确定路径点的判定条件
+    if Path_inverse:
+        # -1 是路径点，我们将其判定为 1 (Positive)
+        target = (target < 0).float()
+        pred = (pred < -thresh_hold).float()
+    else:
+        # 1 是路径点
+        target = (target > 0).float()
+        pred = (pred > thresh_hold).float()
+
+    # 后续计算 TP, FP, FN 的逻辑保持不变...
+    target = target.view(target.size(0), -1)
+    pred = pred.view(pred.size(0), -1)
+    
+    tp = (target * pred).sum(dim=1)
+    fp = ((1 - target) * pred).sum(dim=1)
+    fn = (target * (1 - pred)).sum(dim=1)
+
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+
+    return f1.mean().item()
