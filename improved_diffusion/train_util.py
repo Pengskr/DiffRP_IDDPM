@@ -20,6 +20,7 @@ from .fp16_util import (
 )
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
+from .losses import loss_path_similarity, compute_F1_score
 
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
@@ -35,6 +36,7 @@ class TrainLoop:
         diffusion,
         sample_diffusion,
         Path_inverse,
+        weight_path_similarity,
         sample_Mo,
         sample_Mr,
         sample_P,
@@ -56,6 +58,7 @@ class TrainLoop:
         self.diffusion = diffusion
         self.sample_diffusion = sample_diffusion
         self.Path_inverse = Path_inverse
+        self.weight_path_similarity = weight_path_similarity
         self.sample_Mo = sample_Mo.to(dist_util.dev())
         self.sample_Mr = sample_Mr.to(dist_util.dev())
         self.sample_P = sample_P.to(dist_util.dev())
@@ -234,8 +237,8 @@ class TrainLoop:
             )
             
             # 3. 计算指标
-            loss = self.sample_diffusion.loss_path_similarity(self.sample_P, gen_P).mean().item()
-            f1 = self.sample_diffusion.compute_F1_score(self.sample_P, gen_P, self.Path_inverse)
+            loss = loss_path_similarity(self.weight_path_similarity, self.sample_P, gen_P).mean().item()
+            f1 = compute_F1_score(self.sample_P, gen_P, self.Path_inverse)
             
             # 记录到日志系统
             suffix = "(EMA)" if use_ema else ""
