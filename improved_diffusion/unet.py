@@ -277,7 +277,7 @@ class QKVAttention(nn.Module):
         model.total_ops += th.DoubleTensor([matmul_ops])
 
 
-class UNetModel(nn.Module):
+class UNetModel_with_MFF_MCA(nn.Module):
     """
     The full UNet model with attention and timestep embedding.
 
@@ -316,7 +316,7 @@ class UNetModel(nn.Module):
         num_heads=1,
         num_heads_upsample=-1,
         use_scale_shift_norm=False,
-        use_MFF_MAC = False,
+        use_MFF_MCA=True,
     ):
         super().__init__()
 
@@ -335,7 +335,6 @@ class UNetModel(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.num_heads = num_heads
         self.num_heads_upsample = num_heads_upsample
-        self.use_MFF_MAC = use_MFF_MAC
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -442,20 +441,23 @@ class UNetModel(nn.Module):
             zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1)),
         )
         
-        # 定义 RRDB 地图编码器，输入为 3 通道 (RGB map)，基础通道数需与 model_channels 对齐
-        self.rrdb = RRDBMapEncoder(
-            in_nc=3, 
-            mc=model_channels, 
-            channel_mult=channel_mult
-        )
+        if use_MFF_MCA:
+            # 定义 RRDB 地图编码器，输入为 3 通道 (RGB map)，基础通道数需与 model_channels 对齐
+            self.rrdb = RRDBMapEncoder(
+                in_nc=3, 
+                mc=model_channels, 
+                channel_mult=channel_mult
+            )
 
-        # 定义 MFF 模块列表 (Map Feature Fusion)，为每一个分辨率层级创建一个融合模块
-        self.mff_modules = nn.ModuleList()
-        for mult in channel_mult:
-            self.mff_modules.append(MFFModule(model_channels * mult))
+            # 定义 MFF 模块列表 (Map Feature Fusion)，为每一个分辨率层级创建一个融合模块
+            self.mff_modules = nn.ModuleList()
+            for mult in channel_mult:
+                self.mff_modules.append(MFFModule(model_channels * mult))
 
-        # 定义 MCA 模块 (Map-Conditioned Attention)，放置在编码器末尾（分辨率最低层级）
-        self.mca_module = MCAModule(channels=model_channels * mult)
+            # 定义 MCA 模块 (Map-Conditioned Attention)，放置在编码器末尾（分辨率最低层级）
+            self.mca_module = MCAModule(channels=model_channels * mult)
+        else:
+            self.rrdb = self.mff_modules = self.mca_module = None
 
     def convert_to_fp16(self):
         """
@@ -580,7 +582,7 @@ class UNetModel(nn.Module):
         return result
 
 
-class SuperResModel(UNetModel):
+class SuperResModel(UNetModel_with_MFF_MCA):
     """
     A UNetModel that performs super-resolution.
 
@@ -602,3 +604,39 @@ class SuperResModel(UNetModel):
         x = th.cat([x, upsampled], dim=1)
         return super().get_feature_vectors(x, timesteps, **kwargs)
 
+
+class UNetModel_without_MFF_MCA(UNetModel_with_MFF_MCA):
+    def __init__(self, *args, **kwargs):
+        kwargs['use_MFF_MCA'] = False
+        super().__init__(*args, **kwargs)
+
+    def forward(self, x, timesteps, y=None):
+        """
+        Apply the model to an input batch.
+
+        :param x: an [N x C x ...] Tensor of inputs.
+        :param timesteps: a 1-D batch of timesteps.
+        :param y: an [N] Tensor of labels, if class-conditional.
+        :return: an [N x C x ...] Tensor of outputs.
+        """
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+
+        hs = []
+        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+
+        if self.num_classes is not None:
+            assert y.shape == (x.shape[0],)
+            emb = emb + self.label_emb(y)
+
+        h = x.type(self.inner_dtype)
+        for module in self.input_blocks:    # 解码器（输入层和下采样层），逐层处理输入图像，并在需要时将中间特征图保存到 hs 列表中，以便后续的上采样层使用
+            h = module(h, emb)
+            hs.append(h)
+        h = self.middle_block(h, emb)       # 中间层，处理下采样后的特征图，提取更抽象的特征表示
+        for module in self.output_blocks:   # 编码器（上采样层），逐层处理特征图，并在需要时将之前保存的特征图与当前特征图进行拼接，以便恢复空间分辨率和细节信息
+            cat_in = th.cat([h, hs.pop()], dim=1)
+            h = module(cat_in, emb)
+        h = h.type(x.dtype)
+        return self.out(h)

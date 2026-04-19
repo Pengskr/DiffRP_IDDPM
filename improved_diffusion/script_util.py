@@ -2,8 +2,8 @@ import argparse
 import inspect
 
 from . import gaussian_diffusion as gd
-from .respace import SpacedDiffusion, space_timesteps
-from .unet import SuperResModel, UNetModel
+from .respace import SpacedDiffusion, SpacedDiffusion_without_MFF_MCA, space_timesteps
+from .unet import SuperResModel, UNetModel_with_MFF_MCA, UNetModel_without_MFF_MCA
 
 NUM_CLASSES = 1000
 
@@ -88,6 +88,7 @@ def create_model_and_diffusion(
         timestep_respacing=timestep_respacing,
         biased_initialization = biased_initialization,
         weight_path_similarity= weight_path_similarity,
+        use_MFF_MAC = use_MFF_MAC,
     )
     return model, diffusion
 
@@ -121,8 +122,9 @@ def create_model(
     for res in attention_resolutions.split(","):
         attention_ds.append(image_size // int(res))
 
-    return UNetModel(
-        in_channels=1,                                          # 输入图像的通道数，输入为 M_o  
+    # 提取公共参数字典，避免重复写两遍
+    model_kwargs = dict(
+        in_channels=1 if use_MFF_MAC else 4,                    # 输入图像的通道数，输入为 M_o 或 M_o+M_r
         model_channels=num_channels,                            # mc：模型每一层的基础通道数，乘以channel_mult后得到每一层的实际通道数，中间层的输入输出通道数不变：num_channels * channel_mult[-1]
         out_channels=(1 if not learn_sigma else 2),             # 输出通道数，如果 learn_sigma 为 False，则输出3通道的图像；如果 learn_sigma 为 True，则输出6通道，其中前3通道用于预测图像，后3通道用于预测噪声的方差
         num_res_blocks=num_res_blocks,                          # nr：每个分辨率下的残差块数量  
@@ -134,8 +136,12 @@ def create_model(
         num_heads=num_heads,
         num_heads_upsample=num_heads_upsample,
         use_scale_shift_norm=use_scale_shift_norm,
-        use_MFF_MAC = use_MFF_MAC,
     )
+
+    if use_MFF_MAC:
+        return UNetModel_with_MFF_MCA(**model_kwargs)
+    else:
+        return UNetModel_without_MFF_MCA(**model_kwargs)
 
 
 def sr_model_and_diffusion_defaults():
@@ -253,6 +259,7 @@ def create_gaussian_diffusion(
     timestep_respacing="",
     biased_initialization = False,
     weight_path_similarity = 0.0,
+    use_MFF_MAC = False,
 ):
     betas = gd.get_named_beta_schedule(noise_schedule, steps)
     if use_kl:
@@ -263,7 +270,14 @@ def create_gaussian_diffusion(
         loss_type = gd.LossType.MSE
     if not timestep_respacing:
         timestep_respacing = [steps]
-    return SpacedDiffusion(
+
+    # 根据开关选择不同的类
+    if use_MFF_MAC:
+        diffusion_class = SpacedDiffusion
+    else:
+        diffusion_class = SpacedDiffusion_without_MFF_MCA
+
+    return diffusion_class(
         use_timesteps=space_timesteps(steps, timestep_respacing),
         betas=betas,
         model_mean_type=(

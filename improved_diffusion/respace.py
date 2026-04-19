@@ -1,7 +1,7 @@
 import numpy as np
 import torch as th
 
-from .gaussian_diffusion import GaussianDiffusion
+from .gaussian_diffusion import GaussianDiffusion, GaussianDiffusion_without_MFF_MCA
 
 
 def space_timesteps(num_timesteps, section_counts):
@@ -70,7 +70,7 @@ class SpacedDiffusion(GaussianDiffusion):
     """
 
     def __init__(self, use_timesteps, **kwargs):
-        print(f'use_timesteps in GaussianDiffusion is {use_timesteps}')
+        # print(f'use_timesteps in GaussianDiffusion is {use_timesteps}')
         self.use_timesteps = set(use_timesteps)
         self.timestep_map = []
         self.original_num_steps = len(kwargs["betas"])
@@ -121,3 +121,11 @@ class _WrappedModel:
         if self.rescale_timesteps:
             new_ts = new_ts.float() * (1000.0 / self.original_num_steps)
         return self.model(x, new_ts, **kwargs)
+
+
+class SpacedDiffusion_without_MFF_MCA(SpacedDiffusion, GaussianDiffusion_without_MFF_MCA):
+    """
+    同时具备步长跳过功能和通道拼接逻辑的扩散类。
+    利用多重继承，确保 _run_model 使用的是 GaussianDiffusion_without_MFF_MCA 的版本。
+    """
+    pass
