@@ -257,7 +257,7 @@ def create_gaussian_diffusion(
     rescale_timesteps=False,
     rescale_learned_sigmas=False,
     timestep_respacing="",
-    biased_initialization = False,
+    biased_initialization = 0.0,
     weight_path_similarity = 0.0,
     use_MFF_MAC = False,
 ):
