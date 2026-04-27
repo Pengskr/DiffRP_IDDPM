@@ -581,7 +581,7 @@ class GaussianDiffusion:
 
         return {"sample": mean_pred, "pred_xstart": out["pred_xstart"]}
 
-    def ddim_sample_loop(
+    def sample_loop(
         self,
         model,
         M_o,
@@ -601,7 +601,7 @@ class GaussianDiffusion:
         Same usage as p_sample_loop().
         """
         final = None
-        for sample in self.ddim_sample_loop_progressive(
+        for sample in self.sample_loop_progressive(
             model,
             M_o,
             M_r,
@@ -617,7 +617,7 @@ class GaussianDiffusion:
             final = sample
         return final["sample"]
 
-    def ddim_sample_loop_progressive(
+    def sample_loop_progressive(
         self,
         model,
         M_o,
