@@ -232,7 +232,7 @@ class TrainLoop:
 
         with th.no_grad():
             # 2. 执行采样 (最耗时的部分，只跑一次)
-            gen_P = self.sample_diffusion.ddim_sample_loop(
+            gen_P = self.sample_diffusion.sample_loop(
                 self.model,
                 self.sample_Mo,
                 self.sample_Mr,
