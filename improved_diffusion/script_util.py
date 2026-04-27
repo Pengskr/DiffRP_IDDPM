@@ -2,7 +2,7 @@ import argparse
 import inspect
 
 from . import gaussian_diffusion as gd
-from .respace import SpacedDiffusion, SpacedDiffusion_without_MFF_MCA, space_timesteps
+from .respace import SpacedDiffusion, SpacedDiffusion_without_MFF_MCA, space_timesteps, ConditionalFlowMatch, ConditionalFlowMatch_without_MFF_MCA
 from .unet import SuperResModel, UNetModel_with_MFF_MCA, UNetModel_without_MFF_MCA
 
 NUM_CLASSES = 1000
@@ -61,6 +61,7 @@ def create_model_and_diffusion(
     biased_initialization,
     weight_path_similarity,
     use_MFF_MAC,
+    use_CFM,
 ):
     model = create_model(
         image_size,
@@ -89,6 +90,7 @@ def create_model_and_diffusion(
         biased_initialization = biased_initialization,
         weight_path_similarity= weight_path_similarity,
         use_MFF_MAC = use_MFF_MAC,
+        use_CFM = use_CFM,
     )
     return model, diffusion
 
@@ -260,6 +262,7 @@ def create_gaussian_diffusion(
     biased_initialization = 0.0,
     weight_path_similarity = 0.0,
     use_MFF_MAC = False,
+    use_CFM = False,
 ):
     betas = gd.get_named_beta_schedule(noise_schedule, steps)
     if use_kl:
@@ -272,10 +275,16 @@ def create_gaussian_diffusion(
         timestep_respacing = [steps]
 
     # 根据开关选择不同的类
-    if use_MFF_MAC:
-        diffusion_class = SpacedDiffusion
+    if use_CFM:
+        if use_MFF_MAC:
+            diffusion_class = ConditionalFlowMatch
+        else:
+            diffusion_class = ConditionalFlowMatch_without_MFF_MCA
     else:
-        diffusion_class = SpacedDiffusion_without_MFF_MCA
+        if use_MFF_MAC:
+            diffusion_class = SpacedDiffusion
+        else:
+            diffusion_class = SpacedDiffusion_without_MFF_MCA
 
     return diffusion_class(
         use_timesteps=space_timesteps(steps, timestep_respacing),
