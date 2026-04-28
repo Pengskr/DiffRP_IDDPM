@@ -409,7 +409,7 @@ class UNetModel_with_MFF_MCA(nn.Module):
 
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mult))[::-1]:
-            for i in range(num_res_blocks + 1):
+            for i in range(num_res_blocks + 1):     # +1 是为了跳跃连接时巧妙地接收下采样的结果
                 layers = [
                     ResBlock(
                         ch + input_block_chans.pop(),
