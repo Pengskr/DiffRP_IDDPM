@@ -2,8 +2,9 @@ import argparse
 import inspect
 
 from . import gaussian_diffusion as gd
-from .respace import SpacedDiffusion, SpacedDiffusion_without_MFF_MCA, space_timesteps, ConditionalFlowMatch, ConditionalFlowMatch_without_MFF_MCA
+from .respace import SpacedDiffusion, SpacedDiffusion_without_MFF_MCA, space_timesteps
 from .unet import SuperResModel, UNetModel_with_MFF_MCA, UNetModel_without_MFF_MCA
+from .cfm import ConditionalFlowMatch, ConditionalFlowMatch_without_MFF_MCA
 
 NUM_CLASSES = 1000
 
@@ -35,6 +36,7 @@ def model_and_diffusion_defaults():
         rescale_learned_sigmas=True,
         use_checkpoint=False,
         use_scale_shift_norm=True,
+        use_CFM = True,
     )
 
 
@@ -278,13 +280,17 @@ def create_gaussian_diffusion(
     if use_CFM:
         if use_MFF_MAC:
             diffusion_class = ConditionalFlowMatch
+            print('diffusion: CFM_with_MFF_MCA')
         else:
             diffusion_class = ConditionalFlowMatch_without_MFF_MCA
+            print('diffusion: CFM_without_MFF_MCA')
     else:
         if use_MFF_MAC:
             diffusion_class = SpacedDiffusion
+            print('diffusion: SpacedDiffusion_with_MFF_MCA')
         else:
             diffusion_class = SpacedDiffusion_without_MFF_MCA
+            print('diffusion: SpacedDiffusion_without_MFF_MCA')
 
     return diffusion_class(
         use_timesteps=space_timesteps(steps, timestep_respacing),
