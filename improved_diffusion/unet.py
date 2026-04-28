@@ -511,25 +511,40 @@ class UNetModel_with_MFF_MCA(nn.Module):
             
             h = x.type(self.inner_dtype)
             mff_idx = 0
+            # for i, module in enumerate(self.input_blocks):
+            #     # 执行 U-Net 内部的 ResBlock 或 Downsample 计算
+            #     h = module(h, emb)    
+            #     # 核心注入点 A：检测到下采样完成，立即进行 MFF 融合
+            #     if self._is_downsample_block(module):
+            #         if mff_idx < len(self.mff_modules):
+            #             m_f = map_hierarchical_features[mff_idx]
+            #             # MFF 处理：拼接 -> 深度可分离卷积 -> 残差加回 -> 最终卷积 
+            #             h = self.mff_modules[mff_idx](h, m_f)
+            #             mff_idx += 1
+            #     # 核心注入点 B：在进入中间块 (Bottleneck) 之前应用最后的 MFF 和 MCA [cite: 239]
+            #     if i == len(self.input_blocks) - 1:
+            #         # 对应最后一层级（分辨率最低处）的融合
+            #         if mff_idx < len(self.mff_modules):
+            #             m_f = map_hierarchical_features[mff_idx]
+            #             h = self.mff_modules[mff_idx](h, m_f)
+            #     # 将（融合后的）特征存入 hs，供解码器作为 skip connection 使用
+            #     hs.append(h)
             for i, module in enumerate(self.input_blocks):
-                # 执行 U-Net 内部的 ResBlock 或 Downsample 计算
-                h = module(h, emb)
-                
-                # 核心注入点 A：检测到下采样完成，立即进行 MFF 融合
+                # 核心注入点 A：下采样前进行 MFF 融合
                 if self._is_downsample_block(module):
                     if mff_idx < len(self.mff_modules):
-                        m_f = map_hierarchical_features[mff_idx]
-                        # MFF 处理：拼接 -> 深度可分离卷积 -> 残差加回 -> 最终卷积 
+                        m_f = map_hierarchical_features[mff_idx].type(h.dtype)
                         h = self.mff_modules[mff_idx](h, m_f)
                         mff_idx += 1
-                
                 # 核心注入点 B：在进入中间块 (Bottleneck) 之前应用最后的 MFF 和 MCA [cite: 239]
                 if i == len(self.input_blocks) - 1:
                     # 对应最后一层级（分辨率最低处）的融合
                     if mff_idx < len(self.mff_modules):
-                        m_f = map_hierarchical_features[mff_idx]
+                        m_f = map_hierarchical_features[mff_idx].type(h.dtype)
                         h = self.mff_modules[mff_idx](h, m_f)
-
+                        mff_idx += 1
+                # 执行 U-Net 内部的 ResBlock 或 Downsample 计算
+                h = module(h, emb)
                 # 将（融合后的）特征存入 hs，供解码器作为 skip connection 使用
                 hs.append(h)
 
