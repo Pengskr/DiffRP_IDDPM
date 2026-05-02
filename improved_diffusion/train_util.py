@@ -21,7 +21,7 @@ from .fp16_util import (
 )
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
-from .losses import loss_path_similarity, compute_F1_score
+from .losses import compute_F1_score
 from .script_util import sample_filter
 
 # For ImageNet experiments, this was a good default value.
@@ -37,8 +37,6 @@ class TrainLoop:
         model,
         diffusion,
         sample_diffusion,
-        Path_inverse,
-        weight_path_similarity,
         sample_Mo,
         sample_Mr,
         sample_P,
@@ -55,6 +53,7 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
+        gradient_accumulation_steps=1,  # [新增] 梯度累计步数
     ):
         self.start_time = time.time()
         self.last_log_time = time.time()  # 用于计算局部每秒步数 (Steps Per Second)
@@ -62,8 +61,6 @@ class TrainLoop:
         self.model = model
         self.diffusion = diffusion
         self.sample_diffusion = sample_diffusion
-        self.Path_inverse = Path_inverse
-        self.weight_path_similarity = weight_path_similarity
         self.sample_Mo = sample_Mo.to(dist_util.dev())
         self.sample_Mr = sample_Mr.to(dist_util.dev())
         self.sample_P = sample_P.to(dist_util.dev())
@@ -85,14 +82,16 @@ class TrainLoop:
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
 
+        # [新增] 梯度累加相关属性
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.forward_microsteps = 0     # 用于记录当前的前向传播次数
+
         self.step = 0
         self.resume_step = 0    # 断点续传步数
         self.global_batch = self.batch_size * dist.get_world_size()
 
         # 新增：用于绘图的历史记录
         self.mse_history = []
-        self.test_loss_history = []      # 新增：model 测试损失
-        self.ema_test_loss_history = []  # 新增：ema_model 测试损失
         self.F1_history = []
         self.F1_EMA_history = []
         self.step_history = []
@@ -190,33 +189,32 @@ class TrainLoop:
             not self.lr_anneal_steps                                    # 无限模式：如果 lr_anneal_steps 设为 0（默认通常如此），循环将永远运行下去，直到你手动停止。
             or self.step + self.resume_step < self.lr_anneal_steps      # 有限模式：如果你设定了具体lr_anneal_steps（例如 500,000 步），它会计算 当前步数 + 已训步数 是否达到了目标。
         ):
-            M_o, M_r, P_i, cond, _ = next(self.data)                    # 从数据生成器中获取一个批次的训练数据和对应的条件信息（如果有的话）
-            self.run_step(M_o, M_r, P_i, cond)                          # 执行一个训练步骤，包括前向传播、反向传播和优化器更新
+            opt_stepped = self.run_step()            
 
-            if self.step % self.log_interval == 0:
-                if dist.get_rank() == 0:
-                    gen_P, t_loss, f1 = self.evaluate_and_sample(use_ema=False)
-                    ema_gen_P, ema_t_loss, ema_f1 = self.evaluate_and_sample(use_ema=True)
-                    self.save_comparison_image(self.sample_Mr, self.sample_P, gen_P, ema_gen_P)
+            # [修改] 只有在完成梯度累计，进行实际更新参数后，才进行 evaluate、plot 和 save
+            if opt_stepped:
+                if self.step % self.log_interval == 0:
+                    if dist.get_rank() == 0:
+                        gen_P, f1 = self.evaluate_and_sample(use_ema=False)
+                        ema_gen_P, ema_f1 = self.evaluate_and_sample(use_ema=True)
+                        self.save_comparison_image(self.sample_Mr, self.sample_P, gen_P, ema_gen_P)
+                        
+                        self.F1_history.append(f1)
+                        self.F1_EMA_history.append(ema_f1)
                     
-                    self.test_loss_history.append(t_loss)
-                    self.ema_test_loss_history.append(ema_t_loss)
-                    self.F1_history.append(f1)
-                    self.F1_EMA_history.append(ema_f1)
-                
-                # 统一转储 (此时缓冲区包含训练 mse, step, samples, 以及刚刚存入的 test_loss)
-                report = logger.dumpkvs()
-                if dist.get_rank() == 0:
-                    self.step_history.append(self.step + self.resume_step)
-                    if "mse" in report:
-                        self.mse_history.append(report["mse"])
-                    self.plot_metrics(self.step + self.resume_step)
+                    report = logger.dumpkvs()
+                    if dist.get_rank() == 0:
+                        self.step_history.append(self.step + self.resume_step)
+                        if "mse" in report:
+                            self.mse_history.append(report["mse"])
+                        if "Weighted MSE" in report:
+                            self.mse_history.append(report["Weighted MSE"])
+                        self.plot_metrics(self.step + self.resume_step)
 
-            if self.step % self.save_interval == 0:
-                self.save()                                             # 每隔 save_interval 步，保存模型检查点。
-                # Run for a finite amount of time in integration tests.
-                if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
-                    return
+                if self.step % self.save_interval == 0:
+                    self.save()                                             
+                    if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
+                        return
 
         if (self.step - 1) % self.save_interval != 0:
             self.save()
@@ -242,14 +240,10 @@ class TrainLoop:
             )
             
             # 3. 计算指标
-            loss = loss_path_similarity(self.weight_path_similarity, self.sample_P, gen_P).mean().item()
-            gen_P_filtered = sample_filter(gen_P, self.Path_inverse, threshold_255=100)
-
-            f1 = compute_F1_score(self.sample_P, gen_P_filtered, self.Path_inverse, thresh_hold=0)
-            
+            gen_P_filtered = sample_filter(gen_P, threshold_255=150)
+            f1 = compute_F1_score(self.sample_P, gen_P_filtered, thresh_hold=0)
             # 记录到日志系统
             suffix = "(EMA)" if use_ema else ""
-            logger.logkv(f"test_loss{suffix}", loss)
             logger.logkv(f"F1{suffix}", f1)
 
         # 4. 恢复原始参数
@@ -260,7 +254,7 @@ class TrainLoop:
         self.model.train()
         
         # 返回生成结果
-        return gen_P, loss, f1
+        return gen_P, f1
 
     def save_comparison_image(self, M_r, P, sample, ema_sample):
 
@@ -332,8 +326,6 @@ class TrainLoop:
         
         # --- 左图：绘制 Loss 相关指标 ---
         ax1.plot(self.step_history, self.mse_history, label='Train Loss (MSE)', alpha=0.4)
-        ax1.plot(self.step_history, self.test_loss_history, label='Test Loss (Model)', linewidth=2)
-        ax1.plot(self.step_history, self.ema_test_loss_history, label='Test Loss (EMA)', linewidth=2, linestyle='--')
         
         ax1.set_xlabel('Step')
         ax1.set_ylabel('Loss/MSE')
@@ -366,17 +358,40 @@ class TrainLoop:
         plt.close()         
 
 
-    def run_step(self, M_o, M_r, P_i, cond):
-        self.forward_backward(M_o, M_r, P_i, cond)
-        self.step += 1
-        if self.use_fp16:
-            self.optimize_fp16()
-        else:
-            self.optimize_normal()
-        if self.step % self.log_interval == 0: self.log_step()
+    def run_step(self):
+        # [新增] 如果是累加周期的第一步，清空历史梯度
+        if self.forward_microsteps % self.gradient_accumulation_steps == 0:
+            zero_grad(self.model_params)
+            
+        # [新增] 判断是否是当前累计周期的最后一步
+        is_last_acc_step = (self.forward_microsteps + 1) % self.gradient_accumulation_steps == 0
+        
+        # [修改] 传入 is_last_acc_step 给 forward_backward 以便在 DDP 中正确控制梯度同步
+        self.forward_backward(is_last_acc_step)
+        
+        self.forward_microsteps += 1
+        
+        # [修改] 达到累计步数时才进行优化器更新
+        if is_last_acc_step:
+            self.step += 1
+            if self.use_fp16:
+                self.optimize_fp16()
+            else:
+                self.optimize_normal()
+                
+            if self.step % self.log_interval == 0: 
+                self.log_step()
+                
+            return True   # 告知 run_loop 发生了参数更新
+        
+        return False      # 告知 run_loop 本次仅累计了梯度
 
-    def forward_backward(self, M_o, M_r, P_i, cond):
-        zero_grad(self.model_params)
+    # [修改] 接收 is_last_acc_step 参数
+    def forward_backward(self, is_last_acc_step=True):
+        # zero_grad(self.model_params) <--- [重要：删除这行代码！] 移到了 run_step 中
+
+        M_o, M_r, P_i, cond, _ = next(self.data) 
+
         for i in range(0, M_o.shape[0], self.microbatch):
             micro_M_o = M_o[i : i + self.microbatch].to(dist_util.dev())
             micro_M_r = M_r[i : i + self.microbatch].to(dist_util.dev())
@@ -385,11 +400,12 @@ class TrainLoop:
                 k: v[i : i + self.microbatch].to(dist_util.dev())
                 for k, v in cond.items()
             }
-            last_batch = (i + self.microbatch) >= M_o.shape[0]
+            # [修改] 变量名改一下，防止和原本逻辑混淆
+            last_microbatch = (i + self.microbatch) >= M_o.shape[0]
             t, weights = self.schedule_sampler.sample(micro_M_o.shape[0], dist_util.dev())
 
             compute_losses = functools.partial(
-                self.diffusion.training_losses, # 进行一次前向过程和神经网络预测，计算损失函数，返回一个字典，包含了不同类型的损失（如 "loss", "mse", "vb" 等），这些损失可以用于监控训练过程中的性能和收敛情况
+                self.diffusion.training_losses,
                 self.ddp_model,
                 micro_M_o,
                 micro_M_r,
@@ -398,7 +414,10 @@ class TrainLoop:
                 model_kwargs=micro_cond,
             )
 
-            if last_batch or not self.use_ddp:
+            # [修改] 核心：只有在【最后一次累加】的【最后一个 microbatch】才进行 DDP 梯度同步，极大加快训练速度
+            should_sync = is_last_acc_step and last_microbatch
+            
+            if should_sync or not self.use_ddp:
                 losses = compute_losses()
             else:
                 with self.ddp_model.no_sync():
@@ -410,6 +429,10 @@ class TrainLoop:
                 )
 
             loss = (losses["loss"] * weights).mean()
+            
+            # [新增] 核心：将 loss 除以累计步数，保证多次累加后的总体梯度大小不变
+            loss = loss / self.gradient_accumulation_steps
+            
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )
@@ -468,7 +491,8 @@ class TrainLoop:
 
     def log_step(self):
         logger.logkv("step", self.step + self.resume_step)
-        logger.logkv("samples", (self.step + self.resume_step) * self.global_batch)
+        # [修改] 样本数需要乘以梯度累加步数，以反映真实看过的图片总数
+        logger.logkv("samples", (self.step + self.resume_step) * self.global_batch * self.gradient_accumulation_steps)
         if self.use_fp16:
             logger.logkv("lg_loss_scale", self.lg_loss_scale)
 
