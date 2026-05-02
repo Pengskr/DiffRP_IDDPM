@@ -10,10 +10,9 @@ from torch.utils.data import DataLoader
 
 
 class PairedImageDataset(Dataset):
-    def __init__(self, root_dir, folder_a, folder_b, Path_inverse, num_images, transform=None, threshold=0.99):
+    def __init__(self, root_dir, folder_a, folder_b, num_images, transform=None, threshold=0.99):
         self.dir_a = root_dir / folder_a
         self.dir_b = root_dir / folder_b
-        self.Path_inverse = Path_inverse
         self.transform = transform
         self.extension = ".jpg" 
         self.num_images = num_images
@@ -39,16 +38,13 @@ class PairedImageDataset(Dataset):
             img_c = self.transform(img_c)
         
         img_a = (img_a > self.threshold).float() * 2 - 1
-        if self.Path_inverse:
-            img_b = (img_b <= self.threshold).float() * 2 - 1   # img_b 反相：原本 > threshold 的部分变 -1，原本 <= threshold 的部分变 1
-        else:
-            img_b = (img_b > self.threshold).float() * 2 - 1
+        img_b = (img_b > self.threshold).float() * 2 - 1
         img_c = img_c * 2.0 - 1.0
         
         # 返回成对的张量
         return img_a, img_c, img_b, {}, img_name    # M_o, M_r, P, cond, img_name
 
-def get_dataloader(root_folder_data, folder_Mo, folder_P, Path_inverse, num_images, batch_size, image_size, shuffle = True):
+def get_dataloader(root_folder_data, folder_Mo, folder_P, num_images, batch_size, image_size, shuffle = True):
     data_transform = Compose([
         Resize((image_size, image_size), interpolation=InterpolationMode.NEAREST),
         ToTensor(),
@@ -57,7 +53,6 @@ def get_dataloader(root_folder_data, folder_Mo, folder_P, Path_inverse, num_imag
         root_folder_data,
         folder_Mo,
         folder_P,
-        Path_inverse,
         num_images=num_images,
         transform=data_transform,
         threshold=0.9
@@ -66,7 +61,11 @@ def get_dataloader(root_folder_data, folder_Mo, folder_P, Path_inverse, num_imag
         random_idx = np.random.randint(len(dataset))
         sample_Mo, sample_Mr, sample_P, _, _ = dataset[random_idx]
 
-        print(f"成功加载 {len(dataset)} 对图片,M_o的尺寸为 (C, H, W): {sample_Mo.shape};M_r的尺寸为 (C, H, W): {sample_Mr.shape};P的尺寸为 (C, H, W): {sample_P.shape}")
+        print(f"成功加载 {len(dataset)} 对图片:")
+        print(f" - M_o的尺寸为 {sample_Mo.shape}, 值域为: [{sample_Mo.min().item():.2f}, {sample_Mo.max().item():.2f}]")
+        print(f" - M_r的尺寸为 {sample_Mr.shape}, 值域为: [{sample_Mr.min().item():.2f}, {sample_Mr.max().item():.2f}]")
+        print(f" - P的尺寸为   {sample_P.shape}, 值域为: [{sample_P.min().item():.2f}, {sample_P.max().item():.2f}]")
+
     else:
         print("警告：数据集为空，请检查路径！")
     
