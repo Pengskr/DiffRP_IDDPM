@@ -536,6 +536,10 @@ class UNetModel_with_MFF_MCA(nn.Module):
                         m_f = map_hierarchical_features[mff_idx].type(h.dtype)
                         h = self.mff_modules[mff_idx](h, m_f)
                         mff_idx += 1
+
+                # 执行 U-Net 内部的 ResBlock 或 Downsample 计算
+                h = module(h, emb)
+                
                 # 核心注入点 B：在进入中间块 (Bottleneck) 之前应用最后的 MFF 和 MCA [cite: 239]
                 if i == len(self.input_blocks) - 1:
                     # 对应最后一层级（分辨率最低处）的融合
@@ -543,8 +547,7 @@ class UNetModel_with_MFF_MCA(nn.Module):
                         m_f = map_hierarchical_features[mff_idx].type(h.dtype)
                         h = self.mff_modules[mff_idx](h, m_f)
                         mff_idx += 1
-                # 执行 U-Net 内部的 ResBlock 或 Downsample 计算
-                h = module(h, emb)
+
                 # 将（融合后的）特征存入 hs，供解码器作为 skip connection 使用
                 hs.append(h)
 
