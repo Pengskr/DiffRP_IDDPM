@@ -16,7 +16,6 @@ def model_and_diffusion_defaults():
     return dict(
         image_size=64,
         biased_initialization = False,  # 偏置初始化-范式P2
-        weight_path_similarity = 0.0,
         use_MFF_MAC = False,
         num_channels=64,                # 模型每一层的基础通道数，乘以 channel_mult 后得到每一层的实际通道数，增加 num_channels 可以提升模型的表达能力，但也会增加计算资源的需求
         num_res_blocks=2,
@@ -61,7 +60,6 @@ def create_model_and_diffusion(
     use_checkpoint,
     use_scale_shift_norm,
     biased_initialization,
-    weight_path_similarity,
     use_MFF_MAC,
     use_CFM,
 ):
@@ -90,7 +88,6 @@ def create_model_and_diffusion(
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
         biased_initialization = biased_initialization,
-        weight_path_similarity= weight_path_similarity,
         use_MFF_MAC = use_MFF_MAC,
         use_CFM = use_CFM,
     )
@@ -123,8 +120,9 @@ def create_model(
         raise ValueError(f"unsupported image size: {image_size}")
 
     attention_ds = []
-    for res in attention_resolutions.split(","):
-        attention_ds.append(image_size // int(res))
+    if attention_resolutions.strip():  # 如果字符串不为空，才进行解析
+        for res in attention_resolutions.split(","):
+            attention_ds.append(image_size // int(res))
 
     # 提取公共参数字典，避免重复写两遍
     model_kwargs = dict(
@@ -262,7 +260,6 @@ def create_gaussian_diffusion(
     rescale_learned_sigmas=False,
     timestep_respacing="",
     biased_initialization = 0.0,
-    weight_path_similarity = 0.0,
     use_MFF_MAC = False,
     use_CFM = False,
 ):
@@ -310,7 +307,6 @@ def create_gaussian_diffusion(
         loss_type=loss_type,
         rescale_timesteps=rescale_timesteps,
         biased_initialization=biased_initialization,
-        weight_path_similarity = weight_path_similarity,
     )
 
 
@@ -343,7 +339,7 @@ def str2bool(v):
 
 import torch as th
 
-def sample_filter(sample, Path_inverse=False, threshold_255=50):
+def sample_filter(sample, threshold_255=150):
     """
     专门用于将扩散模型输出映射到 [0, 255] 过滤噪声，并还原回 [-1, 1]
     
@@ -360,14 +356,9 @@ def sample_filter(sample, Path_inverse=False, threshold_255=50):
     # 映射到 [0, 255]
     sample_255 = ((sample + 1) * 127.5).clamp(0, 255)
 
-    if Path_inverse:
-        # 路径是 0。判定范围: [0, threshold_255]
-        # 只要足够“黑”，就是路径
-        sample_bin = th.where(sample_255 < threshold_255, 0.0, 255.0)
-    else:
-        # 路径是 255。判定范围: [255 - threshold_255, 255]
-        # 只要足够“白”，就是路径
-        sample_bin = th.where(sample_255 > (255 - threshold_255), 255.0, 0.0)
+    # 路径是 255。判定范围: [255 - threshold_255, 255]
+    # 只要足够“白”，就是路径
+    sample_bin = th.where(sample_255 > threshold_255, 255.0, 0.0)
         
     # 还原到 [-1, 1]
     # 公式: x_norm = (x_255 / 127.5) - 1

@@ -16,7 +16,7 @@ import torch as th
 import matplotlib.pyplot as plt
 
 from .nn import mean_flat
-from .losses import normal_kl, discretized_gaussian_log_likelihood, loss_path_similarity
+from .losses import normal_kl, discretized_gaussian_log_likelihood
 
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
@@ -128,14 +128,12 @@ class GaussianDiffusion:
         loss_type,
         rescale_timesteps=False,
         biased_initialization=0.0,
-        weight_path_similarity= 0.0,
     ):
         self.model_mean_type = model_mean_type  # 如果 predict_xstart 为 False，则模型预测噪声 epsilon；如果 predict_xstart 为 True，则模型直接预测原始图像 x_0，这两种方式在训练和采样过程中会有不同的表现和效果
         self.model_var_type = model_var_type
         self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
         self.biased_initialization = biased_initialization
-        self.weight_path_similarity = weight_path_similarity
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -771,11 +769,8 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
-
-            pred_xstart = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
-            terms['Path_simi_loss'] = loss_path_similarity(self.weight_path_similarity, x_start, pred_xstart)
             
-            terms["mse"] = mean_flat((target - model_output) ** 2) + terms['Path_simi_loss']  # 模型预测目标（通常是噪声 $\epsilon$）与真实目标之间的均方误差，这是扩散模型最核心的训练目标（考虑路径相似度损失）
+            terms["mse"] = mean_flat((target - model_output) ** 2) # 模型预测目标（通常是噪声 $\epsilon$）与真实目标之间的均方误差，这是扩散模型最核心的训练目标
             
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]          # 模型训练的总目标函数值，如果不学习方差：loss 等于 mse；如果学习方差：loss = mse + vb，这里的 vb 是变分下界（Variational Bound）损失，用于指导模型学习方差。
