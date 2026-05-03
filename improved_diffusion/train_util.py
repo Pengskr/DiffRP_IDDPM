@@ -92,8 +92,12 @@ class TrainLoop:
 
         # 新增：用于绘图的历史记录
         self.mse_history = []
+        self.loss_obs_history = []
+        self.loss_free_history = []
         self.F1_history = []
         self.F1_EMA_history = []
+        self.Col_Rate_history = []
+        self.Col_Rate_EMA_history = []
         self.step_history = []
 
         self.model_params = list(self.model.parameters())
@@ -195,20 +199,24 @@ class TrainLoop:
             if opt_stepped:
                 if self.step % self.log_interval == 0:
                     if dist.get_rank() == 0:
-                        gen_P, f1 = self.evaluate_and_sample(use_ema=False)
-                        ema_gen_P, ema_f1 = self.evaluate_and_sample(use_ema=True)
+                        gen_P, f1, col_rate = self.evaluate_and_sample(use_ema=False)
+                        ema_gen_P, ema_f1, ema_col_rate = self.evaluate_and_sample(use_ema=True)
                         self.save_comparison_image(self.sample_Mr, self.sample_P, gen_P, ema_gen_P)
                         
                         self.F1_history.append(f1)
                         self.F1_EMA_history.append(ema_f1)
+                        self.Col_Rate_history.append(col_rate)
+                        self.Col_Rate_EMA_history.append(ema_col_rate)
                     
                     report = logger.dumpkvs()
                     if dist.get_rank() == 0:
                         self.step_history.append(self.step + self.resume_step)
                         if "mse" in report:
                             self.mse_history.append(report["mse"])
-                        if "Weighted MSE" in report:
-                            self.mse_history.append(report["Weighted MSE"])
+                        if "mse_obs" in report:
+                            self.loss_obs_history.append(report["mse_obs"])
+                        if "mse_free" in report:
+                            self.loss_free_history.append(report["mse_free"])
                         self.plot_metrics(self.step + self.resume_step)
 
                 if self.step % self.save_interval == 0:
@@ -242,9 +250,31 @@ class TrainLoop:
             # 3. 计算指标
             gen_P_filtered = sample_filter(gen_P, threshold_255=150)
             f1 = compute_F1_score(self.sample_P, gen_P_filtered, thresh_hold=0)
+            
+            # 计算物理碰撞率 (Collision Rate):碰撞率 = (生成的路径像素 & 障碍物像素) 的数量 / 生成的路径总像素
+            # 提取预测路径掩码 (使用阈值 0，即大于 0 的视为生成了路径)
+            path_mask = gen_P > 0  
+            
+            # 提取地图中的障碍物掩码 (M_o 中值为 -1 的区域)
+            obs_mask = self.sample_Mo == -1 
+            
+            # 计算路径与障碍物重叠（碰撞）的像素
+            collision_mask = path_mask & obs_mask
+            
+            # 统计像素总数
+            total_path_pixels = path_mask.sum().float()
+            total_collision_pixels = collision_mask.sum().float()
+            
+            # 计算碰撞率，并防止分母为 0
+            if total_path_pixels > 0:
+                collision_rate = (total_collision_pixels / total_path_pixels).item()
+            else:
+                collision_rate = 0.0
+
             # 记录到日志系统
             suffix = "(EMA)" if use_ema else ""
             logger.logkv(f"F1{suffix}", f1)
+            logger.logkv(f"CollisionRate{suffix}", collision_rate) # 新增：将碰撞率写入日志
 
         # 4. 恢复原始参数
         if use_ema:
@@ -253,8 +283,8 @@ class TrainLoop:
         
         self.model.train()
         
-        # 返回生成结果
-        return gen_P, f1
+        # 返回生成结果及指标
+        return gen_P, f1, collision_rate
 
     def save_comparison_image(self, M_r, P, sample, ema_sample):
 
@@ -326,6 +356,10 @@ class TrainLoop:
         
         # --- 左图：绘制 Loss 相关指标 ---
         ax1.plot(self.step_history, self.mse_history, label='Train Loss (MSE)', alpha=0.4)
+        if self.loss_obs_history != []:
+            ax1.plot(self.step_history, self.loss_obs_history, label='Loss obs (MSE)', alpha=0.4)
+        if self.loss_free_history != []:
+            ax1.plot(self.step_history, self.loss_free_history, label='Loss free (MSE)', alpha=0.4)
         
         ax1.set_xlabel('Step')
         ax1.set_ylabel('Loss/MSE')
@@ -337,6 +371,8 @@ class TrainLoop:
         # --- 右图：绘制 F1-score ---
         ax2.plot(self.step_history, self.F1_history, label='F1 (Model)', color='green', linewidth=2)
         ax2.plot(self.step_history, self.F1_EMA_history, label='F1 (EMA)', color='darkgreen', linewidth=2, linestyle='--')
+        ax2.plot(self.step_history, self.Col_Rate_history, label='Col_Rate (Model)', color='blue', linewidth=2)
+        ax2.plot(self.step_history, self.Col_Rate_EMA_history, label='Col_Rate (EMA)', color='darkblue', linewidth=2, linestyle='--')
         
         ax2.set_xlabel('Step')
         ax2.set_ylabel('F1')
@@ -386,10 +422,7 @@ class TrainLoop:
         
         return False      # 告知 run_loop 本次仅累计了梯度
 
-    # [修改] 接收 is_last_acc_step 参数
     def forward_backward(self, is_last_acc_step=True):
-        # zero_grad(self.model_params) <--- [重要：删除这行代码！] 移到了 run_step 中
-
         M_o, M_r, P_i, cond, _ = next(self.data) 
 
         for i in range(0, M_o.shape[0], self.microbatch):
@@ -400,9 +433,15 @@ class TrainLoop:
                 k: v[i : i + self.microbatch].to(dist_util.dev())
                 for k, v in cond.items()
             }
-            # [修改] 变量名改一下，防止和原本逻辑混淆
             last_microbatch = (i + self.microbatch) >= M_o.shape[0]
             t, weights = self.schedule_sampler.sample(micro_M_o.shape[0], dist_util.dev())
+
+            # 计算训练进度并注入到 diffusion 对象中
+            if self.lr_anneal_steps > 0:
+                progress = (self.step + self.resume_step) / self.lr_anneal_steps
+            else:
+                progress = 1.0  # 如果未设置总步数 (无限训练)，直接使用最终权重
+            self.diffusion.current_progress = progress
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
@@ -423,6 +462,13 @@ class TrainLoop:
                 with self.ddp_model.no_sync():
                     losses = compute_losses()
 
+            # 记录并弹出 mse_obs 和 mse_free (避免被 weights 污染)
+            loss_obs_tensor = losses.pop("mse_obs", None)
+            loss_free_tensor = losses.pop("mse_free", None)
+            if loss_obs_tensor is not None and loss_free_tensor is not None:
+                logger.logkv_mean("mse_obs", loss_obs_tensor.mean().item())
+                logger.logkv_mean("mse_free", loss_free_tensor.mean().item())
+                
             if isinstance(self.schedule_sampler, LossAwareSampler):
                 self.schedule_sampler.update_with_local_losses(
                     t, losses["loss"].detach()
